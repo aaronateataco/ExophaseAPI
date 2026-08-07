@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": __REPLIT_ARTIFACT_TITLE_JSON__,
+    "slug": "__REPLIT_ARTIFACT_SLUG__",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "__REPLIT_ARTIFACT_SLUG__",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": false
+    },
+    "android": {},
+    "web": {
+      "favicon": "./assets/images/icon.png"
+    },
+    "plugins": ["expo-router"],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}

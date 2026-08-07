@@ -1,0 +1,40 @@
+name: openscad
+description: 'parametric 3D CAD models: mechanical/printable parts, enclosures, fixtures, handles/grips — not realistic or sculptural shapes like vehicles, characters, or figurines (use generate3DModel for those)'
+kind: web
+
+access:
+  type: all_of
+  conditions:
+    - type: stack
+      name: PNPM_WORKSPACE
+    - type: flag
+      name: gate_gimme_3d
+      variation: 'true'
+
+service_configs:
+  - name: web
+    development:
+      run: pnpm --filter @workspace/__SLUG__ run dev
+    production:
+      serve: static
+      build:
+        - pnpm
+        - --filter
+        - '@workspace/__SLUG__'
+        - run
+        - build
+      publicDir: artifacts/__SLUG__/dist/public
+      rewrites:
+        - from: '/*'
+          to: /index.html
+
+initial_open_files:
+  - src/model.scad
+  - src/App.tsx
+  - src/index.css
+  - scripts/render-scad.ts
+  - package.json
+  - vite.config.ts
+
+additional_skills:
+  - openscad

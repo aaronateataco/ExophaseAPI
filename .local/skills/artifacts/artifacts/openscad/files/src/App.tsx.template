@@ -1,0 +1,262 @@
+import { useEffect, useState } from 'react';
+import {
+  Bounds,
+  Center,
+  ContactShadows,
+  GizmoHelper,
+  GizmoViewport,
+  Grid,
+  OrbitControls,
+} from '@react-three/drei';
+import { Canvas } from '@react-three/fiber';
+import * as THREE from 'three';
+import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
+
+type ModelInfo = {
+  geometry: THREE.BufferGeometry;
+  size: THREE.Vector3;
+  byteLength: number;
+};
+
+type ModelState =
+  | { status: 'loading' }
+  | { status: 'ready'; model: ModelInfo }
+  | { status: 'error'; message: string };
+
+const modelUrl = `${import.meta.env.BASE_URL}model.stl`;
+const missingModelMessage =
+  'Run `pnpm --filter @workspace/__REPLIT_ARTIFACT_SLUG__ run render` to generate public/model.stl.';
+const maxLoadAttempts = 10;
+const retryDelayMs = 1_500;
+
+function useDarkMode(): boolean {
+  const [isDark, setIsDark] = useState(() =>
+    window.matchMedia('(prefers-color-scheme: dark)').matches,
+  );
+
+  useEffect(() => {
+    const query = window.matchMedia('(prefers-color-scheme: dark)');
+    const update = () => setIsDark(query.matches);
+    query.addEventListener('change', update);
+
+    return () => query.removeEventListener('change', update);
+  }, []);
+
+  return isDark;
+}
+
+function ModelViewer({ model }: { model: ModelInfo }) {
+  const isDark = useDarkMode();
+
+  useEffect(() => {
+    return () => model.geometry.dispose();
+  }, [model.geometry]);
+
+  return (
+    <Canvas
+      camera={{ fov: 40, position: [4, 3, 5] }}
+      dpr={[1, 2]}
+      gl={{ antialias: true }}
+    >
+      <color attach="background" args={[isDark ? '#101318' : '#f4f5f7']} />
+      <ambientLight intensity={isDark ? 0.55 : 0.8} />
+      <directionalLight position={[5, 8, 6]} intensity={2.4} />
+      <directionalLight position={[-4, 2, -3]} intensity={0.6} />
+      <Bounds fit clip observe margin={1.25}>
+        <Center>
+          <mesh
+            geometry={model.geometry}
+            rotation-x={-Math.PI / 2}
+            castShadow
+            receiveShadow
+          >
+            <meshStandardMaterial
+              color={isDark ? '#45b8e6' : '#147da6'}
+              metalness={0.12}
+              roughness={0.42}
+            />
+          </mesh>
+        </Center>
+      </Bounds>
+      <Grid
+        position={[0, -model.size.z / 2, 0]}
+        infiniteGrid
+        fadeDistance={80}
+        fadeStrength={5}
+        cellColor={isDark ? '#303844' : '#c8cdd4'}
+        sectionColor={isDark ? '#596574' : '#939ba5'}
+      />
+      <ContactShadows
+        position={[0, -model.size.z / 2, 0]}
+        opacity={isDark ? 0.5 : 0.25}
+        scale={Math.max(model.size.x, model.size.y) * 2}
+        blur={2.5}
+        far={model.size.z * 2}
+      />
+      <OrbitControls makeDefault enableDamping />
+      <GizmoHelper alignment="bottom-right" margin={[72, 72]}>
+        <GizmoViewport
+          axisColors={['#e56b6f', '#6fbd73', '#5b8def']}
+          labelColor={isDark ? '#f5f7fb' : '#101318'}
+        />
+      </GizmoHelper>
+    </Canvas>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) {
+    return `${Math.round(bytes / 1024)} KB`;
+  }
+
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatSize(size: THREE.Vector3): string {
+  return [size.x, size.y, size.z].map((value) => value.toFixed(1)).join(' × ');
+}
+
+function App() {
+  const [modelState, setModelState] = useState<ModelState>({ status: 'loading' });
+
+  useEffect(() => {
+    const abort = new AbortController();
+
+    async function loadModel() {
+      for (let attempt = 1; attempt <= maxLoadAttempts; attempt += 1) {
+        let geometry: THREE.BufferGeometry | undefined;
+
+        try {
+          const response = await fetch(modelUrl, {
+            cache: 'no-store',
+            signal: abort.signal,
+          });
+          if (
+            !response.ok ||
+            response.headers.get('content-type')?.includes('text/html')
+          ) {
+            throw new Error(missingModelMessage);
+          }
+
+          const buffer = await response.arrayBuffer();
+          geometry = new STLLoader().parse(buffer);
+          const position = geometry.getAttribute('position');
+          if (!position || position.count < 3 || position.count % 3 !== 0) {
+            throw new Error('The rendered STL contains no geometry.');
+          }
+
+          geometry.computeVertexNormals();
+          geometry.computeBoundingBox();
+          const size = geometry.boundingBox?.getSize(new THREE.Vector3());
+          if (
+            !size ||
+            ![size.x, size.y, size.z].every(Number.isFinite) ||
+            size.lengthSq() === 0
+          ) {
+            throw new Error('Unable to read the rendered STL bounds.');
+          }
+
+          setModelState({
+            status: 'ready',
+            model: { geometry, size, byteLength: buffer.byteLength },
+          });
+          return;
+        } catch (error) {
+          geometry?.dispose();
+
+          if (abort.signal.aborted) {
+            return;
+          }
+
+          if (attempt === maxLoadAttempts) {
+            setModelState({
+              status: 'error',
+              message: error instanceof Error ? error.message : String(error),
+            });
+            return;
+          }
+
+          await new Promise<void>((resolve) => {
+            const timeout = window.setTimeout(() => {
+              abort.signal.removeEventListener('abort', onAbort);
+              resolve();
+            }, retryDelayMs);
+
+            function onAbort() {
+              window.clearTimeout(timeout);
+              resolve();
+            }
+
+            abort.signal.addEventListener('abort', onAbort, { once: true });
+          });
+
+          if (abort.signal.aborted) {
+            return;
+          }
+        }
+      }
+    }
+
+    loadModel();
+
+    return () => abort.abort();
+  }, []);
+
+  const title = document.title;
+
+  return (
+    <main className="app-shell">
+      <aside className="panel">
+        {/* Edit src/model.scad. OpenSCAD renders the model and Vite reloads this preview. */}
+        <header>
+          <p className="eyebrow">OpenSCAD model</p>
+          <h1>{title}</h1>
+        </header>
+
+        {modelState.status === 'ready' ? (
+          <>
+            <dl className="details">
+              <div>
+                <dt>Dimensions</dt>
+                <dd>{formatSize(modelState.model.size)} mm</dd>
+              </div>
+              <div>
+                <dt>Triangles</dt>
+                <dd>
+                  {Math.round(
+                    modelState.model.geometry.getAttribute('position').count / 3,
+                  ).toLocaleString()}
+                </dd>
+              </div>
+              <div>
+                <dt>File size</dt>
+                <dd>{formatBytes(modelState.model.byteLength)}</dd>
+              </div>
+            </dl>
+
+            <a className="download" href={modelUrl} download="model.stl">
+              Download STL
+            </a>
+          </>
+        ) : (
+          <div className={`status ${modelState.status}`}>
+            {modelState.status === 'loading'
+              ? 'Loading model…'
+              : modelState.message}
+          </div>
+        )}
+      </aside>
+
+      <section className="stage" aria-label="3D model viewer">
+        {modelState.status === 'ready' ? (
+          <ModelViewer model={modelState.model} />
+        ) : (
+          <div className="stage-placeholder">No model to display</div>
+        )}
+        <p className="controls-hint">Drag to orbit · Scroll to zoom</p>
+      </section>
+    </main>
+  );
+}
+
+export default App;

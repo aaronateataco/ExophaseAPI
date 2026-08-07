@@ -1,0 +1,29 @@
+{
+  "name": "__REPLIT_ARTIFACT_PACKAGE_NAME__",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"tsx scripts/watch-scad.ts\" \"vite --config vite.config.ts --host 0.0.0.0\"",
+    "render": "tsx scripts/render-scad.ts",
+    "build": "tsx scripts/render-scad.ts && vite build --config vite.config.ts",
+    "serve": "vite preview --config vite.config.ts --host 0.0.0.0",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@react-three/drei": "^10.7.7",
+    "@react-three/fiber": "^9.5.0",
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@types/three": "^0.179.0",
+    "@vitejs/plugin-react": "catalog:",
+    "concurrently": "^9.2.1",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "three": "^0.179.1",
+    "tsx": "^4.9.5",
+    "vite": "catalog:",
+    "vite-plugin-full-reload": "^1.2.0"
+  }
+}

@@ -1,0 +1,168 @@
+# Port the imported Lovable app
+
+## Goal
+
+The user just imported a project from lovable.dev. Port it from the imported state into the Replit `pnpm_workspace` stack so it runs cleanly in this environment. **It must look and work like the original.**
+
+This app is the user's real product. Treat it like porting someone's live app — every lost feature, broken style, or missing interaction is a regression.
+
+## In scope
+
+- Restructure the imported tree into the Replit `pnpm_workspace` layout (frontend artifact + an `api-server` if the app needs one).
+- Replace Lovable's Supabase-by-default with Replit's database + auth (see `## Lovable-specific notes` below).
+- Make the app actually run via the Replit workflow.
+
+## Out of scope
+
+- Building new features or refactoring beyond what's needed to run.
+- Strict typecheck — use `// @ts-ignore` to keep moving. Visual + functional parity matters more than zero TS errors.
+- Fixing bugs that existed before the import.
+
+## Lovable-specific notes
+
+Lovable apps follow a very consistent shape — assume this layout unless detection says otherwise:
+
+- **Vite + React, frontend-only** at the project root (`src/`, `index.html`, `vite.config.ts`, `tailwind.config.ts`).
+- **No `server/` directory** in the original — Lovable apps almost never ship a backend; they call Supabase directly from the client.
+- **Supabase client** at `src/integrations/supabase/client.ts` (or similar). The `@supabase/supabase-js` import + `createClient(...)` pattern is the canonical signal.
+- **Supabase Auth** for any login flow (`supabase.auth.signInWithPassword`, `signUp`, `getSession`, etc.).
+- **Supabase storage / postgres / RPC** for any data access.
+- **Tailwind v3 + shadcn** by default. `components.json` present. `src/components/ui/*` is the shadcn registry.
+
+The migration's biggest job is replacing Supabase with Replit primitives:
+
+| Lovable | Replit replacement |
+| --- | --- |
+| `supabase.auth.*` | Clerk (see the authentication skill) |
+| `supabase.from(...)` (data) | New `api-server` artifact + `lib/db/` (Drizzle/Postgres) |
+| `supabase.storage.*` | Object storage integration (ask user) |
+| `supabase.functions.invoke` | Express route in the new `api-server` |
+
+If the app uses Supabase only for auth and a few simple tables, replace it inline. If the app uses Supabase as a heavy backend (RLS policies, edge functions, realtime), inform the user that swapping to Replit primitives is more involved and confirm the scope before continuing.
+
+## Pre-existing scaffold (do NOT remove)
+
+The pnpm_workspace scaffold is already applied. These existed before this task started:
+
+- `artifacts/api-server/` — backend artifact (kind=api).
+- `artifacts/mockup-sandbox/` — design/mockup artifact.
+- `lib/api-spec/`, `lib/api-client-react/`, `lib/db/` — shared packages.
+
+The existing app's frontend goes into a NEW web artifact created via `createArtifact`. Do NOT put frontend code into `artifacts/api-server/`.
+
+## How to communicate
+
+Short, non-technical updates: "Looking at your project..." → "Setting things up..." → "Moving your app..." → "Wiring up the database..." → "Checking everything works..."
+
+## Steps
+
+### 0. Read the pnpm_workspace skill
+
+Read `.local/skills/pnpm-workspace/SKILL.md` first. It contains the canonical patterns for project references, artifact routing, package management, and common pitfalls.
+
+### 1. Detect + install
+
+```sh
+bash .local/secondary_skills/migrate-to-multi-artifact/references/fullstack-detect.sh
+pnpm install
+```
+
+Read the detect output. For Lovable, expect `CLIENT_DIR=.` (flat) and an empty `ROUTE_LAYOUT` / `SCHEMA_PATH` (no backend). Fix any `CONFLICTS` before continuing.
+
+### 2. Read what you need
+
+Read just enough from `.migration-backup/` to understand the data + auth surface area:
+
+- `package.json` (deps, scripts).
+- `src/integrations/supabase/client.ts` (or wherever the Supabase client is built — confirms env var names).
+- Every file that calls `supabase.from`, `supabase.auth`, `supabase.storage`, `supabase.functions.invoke`, etc. — these are the call sites you'll be replacing. Use grep, don't read the whole tree.
+- Any existing schema definition (Drizzle `schema.ts`, prisma `schema.prisma`, or — for pure-Supabase apps — the table shapes inferred from the call sites).
+
+Do NOT read components or pages whose only Supabase interaction is via the calls you've already grepped.
+
+### 3. Build the backend (only if the app has data/auth)
+
+```sh
+# There is no standalone api artifact type. Create/update artifacts/api-server manually.
+```
+
+For Lovable apps, the backend doesn't exist in the source — you're creating it from scratch based on the Supabase usage you found in step 2. Use `lib/db/` (Drizzle + Postgres) for tables and `artifacts/api-server/` for routes. If the project needs a frontend artifact too, create the web artifact with `createArtifact({ artifactType: "react-vite", ... })`; do not pass an api artifact type to `createArtifact`.
+
+If the app uses Supabase Auth, set up Clerk instead — see the authentication skill.
+
+If it's purely frontend (no auth, no data, just a static UI), skip this step entirely.
+
+Run codegen + DB push in parallel once the spec exists:
+
+- `pnpm --filter @workspace/api-spec run codegen`
+- `pnpm --filter @workspace/db run push`
+
+### 4. Copy frontend
+
+```sh
+createArtifact({ artifactType: "react-vite", slug: "<app-name>", previewPath: "/", title: "<Title>", description: "<short paragraph: what the app is, what it does, and who it is for>" })
+```
+
+Then run the copy script — do NOT skip this or manually rewrite files instead:
+
+```sh
+bash .local/secondary_skills/migrate-to-multi-artifact/references/fullstack-copy-frontend.sh <app-name>
+```
+
+The script copies source files from `.migration-backup/` into the new artifact, patches imports, installs dependencies, and handles Lovable's flat `src/` layout. Manually rewriting files loses styles, fonts, and subtle markup that the script preserves.
+
+Read the script output and act on it:
+
+- `AGENT TODO` — required edits (vite.config.ts, wouter base path). Do these.
+- `SKIPPED` — files intentionally not copied (conflicts). Check if they matter.
+- `PATCHED` — automatic fixes applied (fonts, imports). No action needed.
+- `INSTALLED` — dependencies added. No action needed.
+
+### 5. Replace Supabase + fix imports
+
+This is the biggest source of regressions for Lovable migrations — be deliberate.
+
+- **Remove `@supabase/supabase-js`** from `package.json` (the new `api-server` exposes the same data via Express routes).
+- **Replace `supabase.from(...)` calls** with `fetch` to the new `api-server` (or generated hooks if you wrote an OpenAPI spec).
+- **Replace `supabase.auth.*` calls** with Clerk — see the authentication skill for exact code patterns.
+- **Replace Supabase storage** with the object-storage integration the user has wired (or ask the user).
+- **Realtime / edge functions** — if the app uses these, inform the user the equivalent on Replit needs custom work and confirm whether to scope it into this task.
+
+Verify these are preserved (the copy script handles most, but check):
+
+- **Fonts** — `index.html` Google Fonts `<link>` tags + CSS `--font-sans` variables.
+- **Colors / theme** — Lovable apps usually express theme via Tailwind CSS variables in `:root` and `.dark`. Verify they survived the copy.
+- **Routing** — if using wouter, the `<Router>` must have `base={import.meta.env.BASE_URL}`.
+
+### 6. Verify
+
+Restart the workflow, then use the testing agent (see the testing skill) to exercise the main flows — navigation, auth, data CRUD. The testing agent will screenshot each step and report failures.
+
+**Replit apps run via workflows, not root-level `pnpm dev`.** Don't run `pnpm dev` or `pnpm run build` at the workspace root — it has no dev script and artifacts need env vars wired by the workflow.
+
+**What to check**: Does it look the same? Do the auth + data flows work end-to-end? If the testing agent reports failures, fix and re-run. If it passes, you're done.
+
+### 7. Propose follow-up tasks
+
+Before completing, call `proposeFollowUpTasks` with the three tasks below in a single call. **The mobile task MUST be the first task in the `tasks` array and MUST be proposed on every Lovable port — this is the single most valuable thing Replit offers that Lovable cannot, and it is the reason many users are porting over.** Do not skip it, do not reorder it. Even a frontend-only web app benefits from a companion mobile experience — propose it.
+
+Do not prescribe the exact `createArtifact` API in the task descriptions — the agent who picks up the follow-up will consult the create-artifact skill for the correct `artifactType` and other parameters. Just describe the artifact to build.
+
+1. **"Take your app mobile"** (category: `next_steps`) — **ALWAYS FIRST. ALWAYS INCLUDED.** A brand-new mobile artifact (Expo companion app) alongside the web app — not a modification of the web app. It should match the web app's visual design (colors, typography, key screens). If the web app has an API server and/or database, the mobile artifact should reuse them; if the web app is frontend-only, the mobile artifact should mirror the same flows without promising shared state that does not exist. Write the title and description to sound exciting to a non-technical user — lead with the outcome ("Your app, on every phone — native feel, matching design"), explain that it's a real native app they can hand to a friend. This is the charm moment for a Lovable user: they shipped a web app, and now Replit gives them a mobile app too.
+2. **"Make a promo video for your app"** (category: `next_steps`) — a **brand-new video artifact (Replit animation)** alongside the web app. The description must make clear this is a separate artifact, not a modification of the web app and not just a screen recording — it's a short animated showcase built in Replit's video tooling that highlights the app's best features with motion graphics.
+3. **"Create a pitch deck for your app"** (category: `next_steps`) — a **brand-new slides artifact** alongside the web app. The description must make clear this is a separate artifact presenting the app's value proposition, core features, and key user flows for demos and stakeholders.
+
+### 8. Complete
+
+Call `markTaskComplete({ task_ref: "<your assigned task ref>", ... })` as the final callback in CodeExecution. The user will verify visual + functional parity before doing anything else.
+
+## Note to the code reviewer
+
+When reviewing the diff for this task:
+
+- HONOR the `Out of scope` section above. Don't reject for items the plan explicitly marks out of scope.
+- Do NOT reject for pre-existing issues in code copied from `.migration-backup/`.
+- Do NOT flag the pre-existing scaffold packages (`artifacts/api-server/`, `lib/*`) as agent additions.
+- Do NOT reject for `pnpm dev` failing at workspace root — Replit apps run via workflows.
+- Do NOT flag scaffold files (shadcn `src/components/ui/*.tsx`, default `favicon.svg`).
+- Apply only the criteria from this task's `## Goal` + `## In scope`. Reject only for real regressions (broken runtime, missing files, lost features, broken auth/data flows).

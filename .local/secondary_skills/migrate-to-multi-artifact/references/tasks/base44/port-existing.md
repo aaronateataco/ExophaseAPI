@@ -1,0 +1,176 @@
+# Port the imported Base44 app
+
+## Goal
+
+The user just imported a project from base44.com. Port it from the imported state into the Replit `pnpm_workspace` stack so it runs cleanly in this environment. **It must look and work like the original.**
+
+This app is the user's real product. Treat it like porting someone's live app — every lost feature, broken style, or missing interaction is a regression.
+
+## In scope
+
+- Restructure the imported tree into the Replit `pnpm_workspace` layout (frontend artifact + an `api-server` backed by Replit Postgres + Clerk for auth).
+- Replace Base44's SDK shims (`base44.entities.*`, `base44.auth.*`, `base44.integrations.*`) with Replit primitives — see `## Base44-specific notes`.
+- Make the app actually run via the Replit workflow.
+
+## Out of scope
+
+- Building new features or refactoring beyond what's needed to run.
+- Strict typecheck — use `// @ts-ignore` to keep moving. Visual + functional parity matters more than zero TS errors.
+- Fixing bugs that existed before the import.
+
+## Base44-specific notes
+
+Base44 apps follow a very consistent shape — assume this layout:
+
+- **Vite + React, JSX (not TSX)** with a flat `src/` at the repo root.
+- **No `server/` directory in the original** — Base44 talks to a hosted SDK, not a backend the user owns.
+- **SDK shim files** live at:
+  - `src/api/base44Client.js`, `src/api/entities.js`, `src/api/integrations.js`
+  - `src/lib/app-params.js`, `src/lib/AuthContext.jsx`
+  - `src/components/ProtectedRoute.jsx`, `src/components/UserNotRegisteredError.jsx`
+- **`@base44/sdk` and `@base44/vite-plugin`** in `package.json` — remove both as part of the migration.
+- **Vite config** wires the Base44 plugin — remove that wiring.
+
+### Replacement map
+
+| Base44 | Replit replacement |
+| --- | --- |
+| `base44.entities.*` | New `api-server` artifact + `lib/db/` (Drizzle + Postgres) + `/api/*` routes |
+| `base44.auth.*` | Clerk (see the authentication skill) |
+| `InvokeLLM` / `GenerateImage` / `ExtractDataFromUploadedFile` | AI integrations (OpenAI / Anthropic) — see migration-guardrails skill |
+| `UploadFile` | Object storage integration (`javascript_object_storage`) |
+| `SendEmail` / `SendSMS` | Integrations skill, else stub |
+| `base44.appLogs.*` | Delete (no equivalent needed) |
+
+### Files to delete after the swap
+
+`base44Client.js`, `entities.js`, `integrations.js`, `app-params.js`, `NavigationTracker.jsx`, `VisualEditAgent.jsx`, `UserNotRegisteredError.jsx`. Keep `AuthContext.jsx` only after rewriting it to wrap Clerk.
+
+## Pre-existing scaffold (do NOT remove)
+
+The pnpm_workspace scaffold is already applied. These existed before this task started:
+
+- `artifacts/api-server/` — backend artifact (kind=api).
+- `artifacts/mockup-sandbox/` — design/mockup artifact.
+- `lib/api-spec/`, `lib/api-client-react/`, `lib/db/` — shared packages.
+
+The existing app's frontend goes into a NEW web artifact created via `createArtifact`. Do NOT put frontend code into `artifacts/api-server/`.
+
+## How to communicate
+
+Short, non-technical updates: "Looking at your project..." → "Setting things up..." → "Moving your app..." → "Wiring up the database..." → "Checking everything works..."
+
+## Steps
+
+### 0. Read the pnpm_workspace skill
+
+Read `.local/skills/pnpm-workspace/SKILL.md` first.
+
+### 1. Detect + install
+
+```sh
+bash .local/secondary_skills/migrate-to-multi-artifact/references/fullstack-detect.sh
+pnpm install
+```
+
+For Base44, expect `CLIENT_DIR=.` (flat) and an empty `ROUTE_LAYOUT` / `SCHEMA_PATH`. Fix any `CONFLICTS` first.
+
+### 2. Read the SDK surface
+
+Read these from `.migration-backup/`:
+
+- `src/api/base44Client.js`, `src/api/entities.js`, `src/api/integrations.js`
+- `src/lib/app-params.js`, `src/lib/AuthContext.jsx`
+- `src/components/ProtectedRoute.jsx`, `src/components/UserNotRegisteredError.jsx`
+- `vite.config.js`
+- `package.json`
+
+Then grep for the actual surface area used:
+
+```sh
+grep -rE "base44\.(entities|integrations\.Core|auth)\." .migration-backup/src
+```
+
+This enumeration drives the shape of the new `api-server` schema and routes.
+
+### 3. Build the backend
+
+Use `lib/db/` (Drizzle + Postgres) to define tables that match the entities you found in step 2. Use `artifacts/api-server/` to expose `/api/*` routes that match the entity calls.
+
+If the app uses `base44.auth.*`, set up Clerk — see the authentication skill.
+
+For AI integrations (`InvokeLLM`, `GenerateImage`, `ExtractDataFromUploadedFile`), use the corresponding Replit AI integration. For storage (`UploadFile`), use the object storage integration.
+
+Run codegen + DB push in parallel once the spec exists:
+
+- `pnpm --filter @workspace/api-spec run codegen`
+- `pnpm --filter @workspace/db run push`
+
+### 4. Copy frontend
+
+```sh
+createArtifact({ artifactType: "react-vite", slug: "<app-name>", previewPath: "/", title: "<Title>", description: "<short paragraph: what the app is, what it does, and who it is for>" })
+```
+
+Then run the copy script — do NOT skip this or manually rewrite files instead:
+
+```sh
+bash .local/secondary_skills/migrate-to-multi-artifact/references/fullstack-copy-frontend.sh <app-name>
+```
+
+The script copies source files from `.migration-backup/` into the new artifact, patches imports, installs dependencies, and handles Base44's flat `src/` layout. Manually rewriting files loses styles, fonts, and subtle markup that the script preserves.
+
+Read the script output and act on it:
+
+- `AGENT TODO` — required edits (vite.config.ts, wouter base path). Do these.
+- `SKIPPED` — files intentionally not copied (conflicts). Check if they matter.
+- `PATCHED` — automatic fixes applied. No action needed.
+- `INSTALLED` — dependencies added. No action needed.
+
+### 5. Replace the SDK + clean up
+
+- **Remove `@base44/sdk` and `@base44/vite-plugin`** from `package.json`. Strip the Base44 plugin from `vite.config.*`.
+- **Replace `base44.entities.*` calls** with `fetch` to your new `/api/*` routes (or generated hooks if you wrote an OpenAPI spec).
+- **Replace `base44.auth.*`** with Clerk — see the authentication skill.
+- **Replace `InvokeLLM` / `GenerateImage` / `ExtractDataFromUploadedFile`** with the matching AI integration.
+- **Replace `UploadFile`** with the object storage integration.
+- **Delete** the shim files listed in the Base44-specific notes section above.
+
+Verify these are preserved (the copy script handles most, but check):
+
+- **Fonts** — `index.html` Google Fonts `<link>` tags + CSS `--font-sans` variables.
+- **Colors / theme** — Base44 apps usually express theme via Tailwind CSS variables in `:root` and `.dark`.
+- **Routing** — if using wouter, the `<Router>` must have `base={import.meta.env.BASE_URL}`.
+
+### 6. Verify
+
+Restart the workflow, then use the testing agent (see the testing skill) to exercise the main flows — navigation, auth, entity CRUD. The testing agent will screenshot each step and report failures.
+
+**Replit apps run via workflows, not root-level `pnpm dev`.** Don't run `pnpm dev` or `pnpm run build` at the workspace root.
+
+**What to check**: Does it look the same? Do the auth + entity flows work end-to-end? If the testing agent reports failures, fix and re-run. If it passes, you're done.
+
+### 7. Propose follow-up tasks
+
+Before completing, call `proposeFollowUpTasks` with the three tasks below in a single call. **The mobile task MUST be the first task in the `tasks` array and MUST be proposed on every Base44 port — this is the single most valuable thing Replit offers that Base44 cannot, and it is the reason many users are porting over.** Do not skip it, do not reorder it. Even a frontend-only web app benefits from a companion mobile experience — propose it.
+
+Do not prescribe the exact `createArtifact` API in the task descriptions — the agent who picks up the follow-up will consult the create-artifact skill for the correct `artifactType` and other parameters. Just describe the artifact to build.
+
+1. **"Take your app mobile"** (category: `next_steps`) — **ALWAYS FIRST. ALWAYS INCLUDED.** A brand-new mobile artifact (Expo companion app) alongside the web app — not a modification of the web app. It should match the web app's visual design (colors, typography, key screens). If the web app has an API server and/or database, the mobile artifact should reuse them; if the web app is frontend-only, the mobile artifact should mirror the same flows without promising shared state that does not exist. Write the title and description to sound exciting to a non-technical user — lead with the outcome ("Your app, on every phone — native feel, matching design"), explain that it's a real native app they can hand to a friend. This is the charm moment for a Base44 user: they shipped a web app, and now Replit gives them a mobile app too.
+2. **"Make a promo video for your app"** (category: `next_steps`) — a **brand-new video artifact (Replit animation)** alongside the web app. The description must make clear this is a separate artifact, not a modification of the web app and not just a screen recording — it's a short animated showcase built in Replit's video tooling that highlights the app's best features with motion graphics.
+3. **"Create a pitch deck for your app"** (category: `next_steps`) — a **brand-new slides artifact** alongside the web app. The description must make clear this is a separate artifact presenting the app's value proposition, core features, and key user flows for demos and stakeholders.
+
+### 8. Complete
+
+Call `markTaskComplete({ task_ref: "<your assigned task ref>", ... })` as the final callback in CodeExecution. The user will verify visual + functional parity before doing anything else.
+
+## Note to the code reviewer
+
+When reviewing the diff for this task:
+
+- HONOR the `Out of scope` section above.
+- Do NOT reject for pre-existing issues in code copied from `.migration-backup/`.
+- Do NOT flag the pre-existing scaffold packages (`artifacts/api-server/`, `lib/*`) as agent additions.
+- Do NOT reject for `pnpm dev` failing at workspace root.
+- Do NOT flag scaffold files (shadcn `src/components/ui/*.tsx`, default `favicon.svg`).
+- Apply only the criteria from this task's `## Goal` + `## In scope`. Reject only for real regressions.

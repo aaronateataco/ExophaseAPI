@@ -1,0 +1,49 @@
+[32mINFO[0m:     Will watch for changes in these directories: ['/home/runner/workspace']
+[32mINFO[0m:     Uvicorn running on [1mhttp://0.0.0.0:5000[0m (Press CTRL+C to quit)
+[32mINFO[0m:     Started reloader process [[36m[1m323[0m] using [36m[1mStatReload[0m
+[32mINFO[0m:     Started server process [[36m335[0m]
+[32mINFO[0m:     Waiting for application startup.
+[32mINFO[0m:     Application startup complete.
+[32mINFO[0m:     10.54.1.23:0 - "[1mGET / HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:36674 - "[1mGET /docs HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:36674 - "[1mGET /openapi.json HTTP/1.1[0m" [32m200 OK[0m
+INFO:httpx:HTTP Request: GET https://www.exophase.com/user/FoxStorm1/ "HTTP/1.1 200 OK"
+ERROR:exophase_api:Unexpected error while fetching profile for 'FoxStorm1'
+Traceback (most recent call last):
+  File "/home/runner/workspace/main.py", line 129, in get_user_profile
+    data = await scraper.scrape_profile(username)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/workspace/scraper.py", line 162, in scrape_profile
+    total_achievements = int(self._clean_numeric_string(numbers[0]))
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: '.'
+[32mINFO[0m:     127.0.0.1:39844 - "[1mGET /api/v1/user/FoxStorm1/profile HTTP/1.1[0m" [91m500 Internal Server Error[0m
+[33mWARNING[0m:  StatReload detected changes in 'scraper.py'. Reloading...
+[32mINFO[0m:     Shutting down
+[32mINFO[0m:     Waiting for application shutdown.
+[32mINFO[0m:     Application shutdown complete.
+[32mINFO[0m:     Finished server process [[36m335[0m]
+[32mINFO[0m:     Started server process [[36m705[0m]
+[32mINFO[0m:     Waiting for application startup.
+[32mINFO[0m:     Application startup complete.
+[33mWARNING[0m:  StatReload detected changes in 'main.py'. Reloading...
+[32mINFO[0m:     Shutting down
+[32mINFO[0m:     Waiting for application shutdown.
+[32mINFO[0m:     Application shutdown complete.
+[32mINFO[0m:     Finished server process [[36m705[0m]
+[32mINFO[0m:     Started server process [[36m711[0m]
+[32mINFO[0m:     Waiting for application startup.
+[32mINFO[0m:     Application startup complete.
+[33mWARNING[0m:  StatReload detected changes in 'main.py'. Reloading...
+[32mINFO[0m:     Shutting down
+[32mINFO[0m:     Waiting for application shutdown.
+[32mINFO[0m:     Application shutdown complete.
+[32mINFO[0m:     Finished server process [[36m711[0m]
+[32mINFO[0m:     Started server process [[36m724[0m]
+[32mINFO[0m:     Waiting for application startup.
+[32mINFO[0m:     Application startup complete.
+[32mINFO[0m:     Shutting down
+[32mINFO[0m:     Waiting for application shutdown.
+[32mINFO[0m:     Application shutdown complete.
+[32mINFO[0m:     Finished server process [[36m724[0m]
+[32mINFO[0m:     Stopping reloader process [[36m[1m323[0m]
