@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # Import our robust scraper
-from scraper import ExophaseScraper, UserNotFoundError, PrivateProfileError, ScraperError
+from scraper import ExophaseScraper, UserNotFoundError, PrivateProfileError, ScraperError, NotSupportedError
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -169,6 +169,9 @@ async def get_user_games(
         games = await scraper.scrape_games(username)
         games_cache.set(cache_key, games)
         return games
+    except NotSupportedError as e:
+        logger.warning(f"Games list not supported: {e}")
+        raise HTTPException(status_code=501, detail=str(e))
     except UserNotFoundError as e:
         logger.warning(f"Games list not found for username '{username}': {e}")
         raise HTTPException(status_code=404, detail=str(e))
