@@ -247,3 +247,94 @@ class ExophaseScraper:
             "headless browser (e.g. Playwright or Selenium).  Profile data is still "
             "fully available via GET /api/v1/user/{username}/profile."
         )
+
+    # ------------------------------------------------------------------
+    # Game achievement catalogue
+    # ------------------------------------------------------------------
+    async def scrape_game_achievements(self, slug: str) -> Dict[str, Any]:
+        """
+        Scrape the full achievement catalogue for one game.
+
+        Unlike the user games list, this page IS server-rendered — every award
+        is present in the static HTML with its id, points, rarity and icon — so
+        a plain HTTP client is enough and no headless browser is needed.
+
+        `slug` is Exophase's own game slug, which carries the platform as a
+        suffix (``hill-climb-racing-android`` is the Google Play listing of
+        Hill Climb Racing).  Pass it exactly as it appears in the URL.
+
+        Returns
+        -------
+        dict
+            ``{"slug", "title", "platform", "total", "achievements": [...]}``
+            where each achievement carries ``id`` (Exophase's global award id),
+            ``index`` (its position in the game's own list), ``name``,
+            ``description``, ``points``, ``rarity_percent``, ``earned_count``,
+            ``secret`` and ``icon_url``.  ``earned_count`` is user-scoped and
+            reads 0 for an unauthenticated fetch — the catalogue is what this
+            endpoint is for; who has unlocked what is not.
+
+        Raises
+        ------
+        UserNotFoundError
+            No such game/platform slug (404).
+        ScraperError
+            The page loaded but contained no award markup.
+        """
+        url = f"{self.base_url}/game/{slug}/achievements/"
+
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            html = await self._get_html(client, url)
+
+        soup = BeautifulSoup(html, "html.parser")
+        awards = soup.select("li.award")
+        if not awards:
+            raise ScraperError(
+                f"No achievements found at {url} — the slug may be wrong, or the "
+                f"game may have no achievement list on Exophase."
+            )
+
+        # The game name is the page's first h2 — there is no h1 on this
+        # template, and og:title carries " Achievements - <platform>" glued on.
+        title_el = soup.select_one("h2")
+        platform_el = soup.select_one(".exo-icon-collection-services + span, .generic span")
+
+        out: List[Dict[str, Any]] = []
+        for a in awards:
+            classes = a.get("class") or []
+
+            title_link = a.select_one(".award-title a")
+            name = self._direct_text(title_link) if title_link else ""
+            if not name:
+                name = self._direct_text(a.select_one(".award-title")) if a.select_one(".award-title") else ""
+
+            desc_el = a.select_one(".award-description")
+            description = desc_el.get_text(" ", strip=True) if desc_el else ""
+
+            img = a.select_one("img.award-image")
+            icon_url = img.get("src") if img else None
+
+            # Rarity is carried twice: as a data attribute and as display text.
+            # The attribute is the reliable one — the text is localised and
+            # carries the EXP value in the same string.
+            out.append({
+                "id":             self._parse_int(a.get("id") or a.get("data-master") or "0"),
+                "index":          self._parse_int(a.get("data-award-id") or "0"),
+                "name":           name,
+                "description":    description,
+                "points":         self._parse_int(a.get("data-points") or "0"),
+                "rarity_percent": self._parse_float(a.get("data-average") or "0"),
+                "earned_count":   self._parse_int(a.get("data-earned") or "0"),
+                "secret":         "secret" in classes,
+                "icon_url":       icon_url,
+                "url":            title_link.get("href") if title_link else None,
+            })
+
+        return {
+            "slug":         slug,
+            "title":        title_el.get_text(strip=True) if title_el else slug,
+            "platform":     platform_el.get_text(strip=True) if platform_el else None,
+            "total":        len(out),
+            "achievements": out,
+            "source_url":   url,
+        }

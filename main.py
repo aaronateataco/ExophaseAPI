@@ -57,6 +57,9 @@ class AsyncTTLMemoryCache:
 # Initialize caches with 5-minute TTL (300 seconds)
 profile_cache = AsyncTTLMemoryCache(ttl_seconds=300)
 games_cache = AsyncTTLMemoryCache(ttl_seconds=300)
+# A game's achievement catalogue changes only when the developer ships new
+# ones, so it is cached far longer than the per-user views.
+catalogue_cache = AsyncTTLMemoryCache(ttl_seconds=21600)
 
 # Scraper Instance Dependency
 def get_scraper() -> ExophaseScraper:
@@ -84,6 +87,26 @@ class GameItem(BaseModel):
     playtime_hours: float = Field(..., description="Recorded hours of gameplay for this specific game.")
     game_slug: str = Field(..., description="The unique Exophase URL identifier or slug for the game.")
     game_url: str = Field(..., description="Direct link to Exophase page for the game.")
+
+class Achievement(BaseModel):
+    id: int = Field(..., description="Exophase's global award id.")
+    index: int = Field(..., description="Position in the game's own achievement list.")
+    name: str = Field(..., description="Achievement display name.")
+    description: str = Field("", description="Achievement description; empty for some secrets.")
+    points: int = Field(0, description="Points (XP) the platform awards for it.")
+    rarity_percent: float = Field(0.0, description="Percentage of tracked players who have it.")
+    earned_count: int = Field(0, description="User-scoped; 0 for an unauthenticated fetch.")
+    secret: bool = Field(False, description="Hidden until unlocked on the platform.")
+    icon_url: Optional[str] = Field(None, description="Direct URL to the 64x64 award icon.")
+    url: Optional[str] = Field(None, description="Exophase permalink for the achievement.")
+
+class GameAchievements(BaseModel):
+    slug: str = Field(..., description="Exophase game slug, platform suffix included.")
+    title: str = Field(..., description="Game display name.")
+    platform: Optional[str] = Field(None, description="Platform the list belongs to, e.g. Google Play.")
+    total: int = Field(..., description="Number of achievements in the list.")
+    achievements: List[Achievement]
+    source_url: str = Field(..., description="Page the data was scraped from.")
 
 class ErrorDetail(BaseModel):
     detail: str = Field(..., description="Descriptive error message indicating what went wrong.")
@@ -183,4 +206,49 @@ async def get_user_games(
         raise HTTPException(status_code=500, detail=f"Failed to scrape Exophase games: {e}")
     except Exception as e:
         logger.exception(f"Unexpected error while fetching games for '{username}'")
+        raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {e}")
+
+
+@app.get(
+    "/api/v1/game/{slug}/achievements",
+    response_model=GameAchievements,
+    responses={
+        404: {"model": ErrorDetail, "description": "No such game slug, or no achievement list for it"},
+        500: {"model": ErrorDetail, "description": "Scraper or network failure"},
+    },
+    summary="Get a game's full achievement catalogue",
+    description=(
+        "Retrieves every achievement defined for one game, with points, rarity, "
+        "secret flag and icon. Unlike the per-user games list, this page is "
+        "server-rendered, so it needs no headless browser.\n\n"
+        "The slug carries the platform as a suffix — pass "
+        "`hill-climb-racing-android` for the Google Play listing of Hill Climb "
+        "Racing, as it appears in the Exophase URL."
+    ),
+)
+async def get_game_achievements(
+    slug: str = Path(..., description="Exophase game slug, e.g. hill-climb-racing-android", min_length=1),
+    scraper: ExophaseScraper = Depends(get_scraper),
+):
+    cache_key = f"catalogue:{slug.lower()}"
+
+    cached_data = catalogue_cache.get(cache_key)
+    if cached_data:
+        return cached_data
+
+    try:
+        data = await scraper.scrape_game_achievements(slug)
+        catalogue_cache.set(cache_key, data)
+        return data
+    except UserNotFoundError as e:
+        logger.warning(f"No achievement list for slug '{slug}': {e}")
+        raise HTTPException(status_code=404, detail=str(e))
+    except PrivateProfileError as e:
+        logger.warning(f"Achievement list forbidden for slug '{slug}': {e}")
+        raise HTTPException(status_code=403, detail=str(e))
+    except ScraperError as e:
+        logger.error(f"Scraper error for slug '{slug}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to scrape Exophase achievements: {e}")
+    except Exception as e:
+        logger.exception(f"Unexpected error while fetching achievements for '{slug}'")
         raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {e}")
