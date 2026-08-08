@@ -211,7 +211,7 @@ class ExophaseScraper:
         async with httpx.AsyncClient() as client:
             html = await self._get_html(client, url)
 
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "lxml")
 
         # ── 1. Avatar URL ──────────────────────────────────────────────
         pfp_url: Optional[str] = None
@@ -327,7 +327,7 @@ class ExophaseScraper:
         profile page — required by every api.exophase.com call below."""
         url = f"{self.base_url}/user/{username}/"
         html = await self._get_html(client, url)
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "lxml")
         header = soup.select_one("div.user-header.global[data-playerid]")
         if not header or not header.get("data-playerid"):
             raise UserNotFoundError(f"Could not resolve a player id for '{username}'.")
@@ -477,7 +477,7 @@ class ExophaseScraper:
             )
         return self._apply_earned(catalogue, earned_by_id)
 
-    async def scrape_all_user_achievements(self, username: str, concurrency: int = 8) -> List[Dict[str, Any]]:
+    async def scrape_all_user_achievements(self, username: str, concurrency: int = 30) -> List[Dict[str, Any]]:
         """
         Every achievement the user has actually earned, across every game
         they've played, each with its name, description, points, rarity,
@@ -486,12 +486,15 @@ class ExophaseScraper:
         This fans out one catalogue scrape + one earned-awards API call per
         game that has at least one earned achievement (games with zero
         earned awards are skipped — nothing to report), bounded by
-        `concurrency` concurrent requests. For an account with hundreds of
-        played games this is genuinely slow (many seconds, potentially over
-        a minute) and puts a meaningful number of requests through
-        Exophase's API — prefer `scrape_user_game_achievements` for a single
-        game, or `scrape_recent_achievements` for a cheap recent-activity
-        feed, when either fits the use case.
+        `concurrency` concurrent requests and all sharing one pooled HTTP
+        client, so games don't each pay for a fresh TLS handshake, with the
+        catalogue fetch and the earned-awards fetch for each game running
+        concurrently rather than back-to-back. For an account with hundreds
+        of played games this is still genuinely slow (several seconds,
+        potentially more) and puts a meaningful number of requests
+        through Exophase's API — prefer `scrape_user_game_achievements` for
+        a single game, or `scrape_recent_achievements` for a cheap recent-
+        activity feed, when either fits the use case.
         """
         games = await self.scrape_games(username)
         playable = [
@@ -504,9 +507,11 @@ class ExophaseScraper:
         async def fetch_one(client: httpx.AsyncClient, game: Dict[str, Any]) -> List[Dict[str, Any]]:
             async with semaphore:
                 try:
-                    catalogue = await self.scrape_game_achievements(game["game_slug"])
-                    earned_by_id = await self._fetch_earned_map(
-                        client, game["player_id"], game["master_id"], game["earned_awards"]
+                    catalogue, earned_by_id = await asyncio.gather(
+                        self.scrape_game_achievements(game["game_slug"], client=client),
+                        self._fetch_earned_map(
+                            client, game["player_id"], game["master_id"], game["earned_awards"]
+                        ),
                     )
                 except ScraperError:
                     return []
@@ -521,7 +526,8 @@ class ExophaseScraper:
                     out.append(entry)
             return out
 
-        async with httpx.AsyncClient() as client:
+        limits = httpx.Limits(max_connections=concurrency * 2, max_keepalive_connections=concurrency)
+        async with httpx.AsyncClient(limits=limits) as client:
             results = await asyncio.gather(*(fetch_one(client, g) for g in playable))
 
         all_earned: List[Dict[str, Any]] = [entry for page in results for entry in page]
@@ -531,42 +537,13 @@ class ExophaseScraper:
     # ------------------------------------------------------------------
     # Game achievement catalogue
     # ------------------------------------------------------------------
-    async def scrape_game_achievements(self, slug: str) -> Dict[str, Any]:
-        """
-        Scrape the full achievement catalogue for one game.
-
-        Unlike the user games list, this page IS server-rendered — every award
-        is present in the static HTML with its id, points, rarity and icon — so
-        a plain HTTP client is enough and no headless browser is needed.
-
-        `slug` is Exophase's own game slug, which carries the platform as a
-        suffix (``hill-climb-racing-android`` is the Google Play listing of
-        Hill Climb Racing).  Pass it exactly as it appears in the URL.
-
-        Returns
-        -------
-        dict
-            ``{"slug", "title", "platform", "total", "achievements": [...]}``
-            where each achievement carries ``id`` (Exophase's global award id),
-            ``index`` (its position in the game's own list), ``name``,
-            ``description``, ``points``, ``rarity_percent``, ``earned_count``,
-            ``secret`` and ``icon_url``.  ``earned_count`` is user-scoped and
-            reads 0 for an unauthenticated fetch — the catalogue is what this
-            endpoint is for; who has unlocked what is not.
-
-        Raises
-        ------
-        UserNotFoundError
-            No such game/platform slug (404).
-        ScraperError
-            The page loaded but contained no award markup.
-        """
-        url = f"{self.base_url}/game/{slug}/achievements/"
-
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            html = await self._get_html(client, url)
-
-        soup = BeautifulSoup(html, "html.parser")
+    def _parse_game_achievements_html(self, html: str, slug: str, url: str) -> Dict[str, Any]:
+        """CPU-bound HTML parsing half of `scrape_game_achievements`, split out
+        so it can be run in a worker thread via `asyncio.to_thread` — parsing a
+        ~100KB+ catalogue page with BeautifulSoup is slow enough to noticeably
+        block the event loop otherwise, which matters when dozens of these run
+        concurrently in `scrape_all_user_achievements`."""
+        soup = BeautifulSoup(html, "lxml")
         awards = soup.select("li.award")
         if not awards:
             raise ScraperError(
@@ -618,3 +595,49 @@ class ExophaseScraper:
             "achievements": out,
             "source_url":   url,
         }
+
+    async def scrape_game_achievements(
+        self, slug: str, client: Optional[httpx.AsyncClient] = None
+    ) -> Dict[str, Any]:
+        """
+        Scrape the full achievement catalogue for one game.
+
+        Unlike the user games list, this page IS server-rendered — every award
+        is present in the static HTML with its id, points, rarity and icon — so
+        a plain HTTP client is enough and no headless browser is needed.
+
+        `slug` is Exophase's own game slug, which carries the platform as a
+        suffix (``hill-climb-racing-android`` is the Google Play listing of
+        Hill Climb Racing).  Pass it exactly as it appears in the URL.
+
+        An existing `client` can be passed in to reuse its connection pool —
+        `scrape_all_user_achievements` does this across dozens of games so
+        each one doesn't pay for a fresh TLS handshake.
+
+        Returns
+        -------
+        dict
+            ``{"slug", "title", "platform", "total", "achievements": [...]}``
+            where each achievement carries ``id`` (Exophase's global award id),
+            ``index`` (its position in the game's own list), ``name``,
+            ``description``, ``points``, ``rarity_percent``, ``earned_count``,
+            ``secret`` and ``icon_url``.  ``earned_count`` is user-scoped and
+            reads 0 for an unauthenticated fetch — the catalogue is what this
+            endpoint is for; who has unlocked what is not.
+
+        Raises
+        ------
+        UserNotFoundError
+            No such game/platform slug (404).
+        ScraperError
+            The page loaded but contained no award markup.
+        """
+        url = f"{self.base_url}/game/{slug}/achievements/"
+
+        if client is not None:
+            html = await self._get_html(client, url)
+        else:
+            async with httpx.AsyncClient(follow_redirects=True) as owned_client:
+                html = await self._get_html(owned_client, url)
+
+        return self._parse_game_achievements_html(html, slug, url)
