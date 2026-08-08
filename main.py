@@ -1,7 +1,7 @@
 import time
 import logging
 from typing import List, Dict, Tuple, Any, Optional
-from fastapi import FastAPI, HTTPException, Path, Depends
+from fastapi import FastAPI, HTTPException, Path, Query, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -64,10 +64,24 @@ user_game_achievements_cache = AsyncTTLMemoryCache(ttl_seconds=300)
 recent_achievements_cache = AsyncTTLMemoryCache(ttl_seconds=120)
 # Expensive to build (fans out across every played game) — cached longest.
 all_achievements_cache = AsyncTTLMemoryCache(ttl_seconds=900)
+# Cheap: one profile-page fetch + one recent-awards call, run concurrently.
+summary_cache = AsyncTTLMemoryCache(ttl_seconds=180)
 
 # Scraper Instance Dependency
 def get_scraper() -> ExophaseScraper:
     return ExophaseScraper()
+
+# --------------------------------------------------------------------------
+# EDGE / CDN CACHING (stale-while-revalidate)
+# --------------------------------------------------------------------------
+# Vercel's edge network honours standard Cache-Control on Function responses,
+# so a request that's cacheable at the edge never even reaches this function
+# (and therefore never hits Exophase) — this is the main latency win, on top
+# of the in-memory TTL caches above which only help a warm instance.
+def set_cache_control(response: Response, s_maxage: int, stale_while_revalidate: int) -> None:
+    response.headers["Cache-Control"] = (
+        f"public, max-age=60, s-maxage={s_maxage}, stale-while-revalidate={stale_while_revalidate}"
+    )
 
 # --------------------------------------------------------------------------
 # PYDANTIC SCHEMAS (DATA MODELS)
@@ -137,6 +151,28 @@ class RecentAchievement(BaseModel):
     game_title: str = Field(..., description="The game this achievement belongs to.")
     platform: str = Field(..., description="The platform it was earned on.")
 
+class AchievementsStats(BaseModel):
+    total_unlocked: int = Field(..., description="Achievements returned by this request (after any platform filter).")
+    total_games: int = Field(..., description="Distinct games represented in this request's results.")
+    total_points: int = Field(..., description="Sum of points across the returned achievements.")
+
+class UserAchievementsResponse(BaseModel):
+    username: str = Field(..., description="The Exophase username these achievements belong to.")
+    stats: AchievementsStats = Field(..., description="Aggregated counters, so the client doesn't have to sum the array itself.")
+    page: int = Field(1, description="Current page (1-indexed) when `limit` is used.")
+    limit: Optional[int] = Field(None, description="Page size, if pagination was requested.")
+    has_more: bool = Field(False, description="Whether more pages exist beyond this one.")
+    achievements: List[UserAchievement]
+
+class SummaryResponse(BaseModel):
+    username: str = Field(..., description="The user's Exophase username.")
+    profile_picture_url: Optional[str] = Field(None, description="Direct URL to the user's profile avatar image.")
+    stats: StatsModel = Field(..., description="Aggregated gamer statistics.")
+    connected_platforms: List[str] = Field(..., description="List of verified gaming networks connected to Exophase.")
+    platforms: List[PlatformStats] = Field(..., description="Per-platform breakdown.")
+    recent_achievements: List[RecentAchievement] = Field(..., description="The user's most recently unlocked achievements.")
+    profile_url: str = Field(..., description="Direct link to the Exophase profile page.")
+
 class GameAchievements(BaseModel):
     slug: str = Field(..., description="Exophase game slug, platform suffix included.")
     title: str = Field(..., description="Game display name.")
@@ -174,11 +210,13 @@ async def root():
     description="Retrieves PFP, gaming platforms connected, and overall aggregate stats for a public Exophase user."
 )
 async def get_user_profile(
+    response: Response,
     username: str = Path(..., description="Exophase username (case-insensitive)", min_length=1),
     scraper: ExophaseScraper = Depends(get_scraper)
 ):
+    set_cache_control(response, s_maxage=profile_cache.ttl, stale_while_revalidate=600)
     cache_key = f"profile:{username.lower()}"
-    
+
     # Check Cache
     cached_data = profile_cache.get(cache_key)
     if cached_data:
@@ -220,36 +258,44 @@ async def get_user_profile(
     )
 )
 async def get_user_games(
+    response: Response,
     username: str = Path(..., description="Exophase username (case-insensitive)", min_length=1),
+    platform: Optional[str] = Query(None, description="Filter to one platform, e.g. 'steam' or 'Google Play' (case-insensitive)."),
+    limit: Optional[int] = Query(None, ge=1, le=200, description="Max games to return."),
+    page: int = Query(1, ge=1, description="1-indexed page, used with `limit`."),
     scraper: ExophaseScraper = Depends(get_scraper)
 ):
+    set_cache_control(response, s_maxage=games_cache.ttl, stale_while_revalidate=600)
     cache_key = f"games:{username.lower()}"
-    
-    # Check Cache
-    cached_data = games_cache.get(cache_key)
-    if cached_data:
-        return cached_data
 
-    # Scrape and cache
-    try:
-        games = await scraper.scrape_games(username)
-        games_cache.set(cache_key, games)
-        return games
-    except NotSupportedError as e:
-        logger.warning(f"Games list not supported: {e}")
-        raise HTTPException(status_code=501, detail=str(e))
-    except UserNotFoundError as e:
-        logger.warning(f"Games list not found for username '{username}': {e}")
-        raise HTTPException(status_code=404, detail=str(e))
-    except PrivateProfileError as e:
-        logger.warning(f"Games list is private for username '{username}': {e}")
-        raise HTTPException(status_code=403, detail=str(e))
-    except ScraperError as e:
-        logger.error(f"Scraper error while fetching games for '{username}': {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to scrape Exophase games: {e}")
-    except Exception as e:
-        logger.exception(f"Unexpected error while fetching games for '{username}'")
-        raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {e}")
+    # Check Cache
+    games = games_cache.get(cache_key)
+    if games is None:
+        try:
+            games = await scraper.scrape_games(username)
+            games_cache.set(cache_key, games)
+        except NotSupportedError as e:
+            logger.warning(f"Games list not supported: {e}")
+            raise HTTPException(status_code=501, detail=str(e))
+        except UserNotFoundError as e:
+            logger.warning(f"Games list not found for username '{username}': {e}")
+            raise HTTPException(status_code=404, detail=str(e))
+        except PrivateProfileError as e:
+            logger.warning(f"Games list is private for username '{username}': {e}")
+            raise HTTPException(status_code=403, detail=str(e))
+        except ScraperError as e:
+            logger.error(f"Scraper error while fetching games for '{username}': {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to scrape Exophase games: {e}")
+        except Exception as e:
+            logger.exception(f"Unexpected error while fetching games for '{username}'")
+            raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {e}")
+
+    if platform:
+        wanted = platform.strip().lower()
+        games = [g for g in games if g["platform"].lower() == wanted]
+    if limit:
+        games = games[(page - 1) * limit: page * limit]
+    return games
 
 
 @app.get(
@@ -270,9 +316,11 @@ async def get_user_games(
     ),
 )
 async def get_game_achievements(
+    response: Response,
     slug: str = Path(..., description="Exophase game slug, e.g. hill-climb-racing-android", min_length=1),
     scraper: ExophaseScraper = Depends(get_scraper),
 ):
+    set_cache_control(response, s_maxage=catalogue_cache.ttl, stale_while_revalidate=86400)
     cache_key = f"catalogue:{slug.lower()}"
 
     cached_data = catalogue_cache.get(cache_key)
@@ -314,10 +362,12 @@ async def get_game_achievements(
     ),
 )
 async def get_user_game_achievements(
+    response: Response,
     username: str = Path(..., description="Exophase username (case-insensitive)", min_length=1),
     slug: str = Path(..., description="Exophase game slug, e.g. hill-climb-racing-android", min_length=1),
     scraper: ExophaseScraper = Depends(get_scraper),
 ):
+    set_cache_control(response, s_maxage=user_game_achievements_cache.ttl, stale_while_revalidate=600)
     cache_key = f"user_game_achievements:{username.lower()}:{slug.lower()}"
 
     cached_data = user_game_achievements_cache.get(cache_key)
@@ -359,9 +409,11 @@ async def get_user_game_achievements(
     ),
 )
 async def get_user_recent_achievements(
+    response: Response,
     username: str = Path(..., description="Exophase username (case-insensitive)", min_length=1),
     scraper: ExophaseScraper = Depends(get_scraper),
 ):
+    set_cache_control(response, s_maxage=recent_achievements_cache.ttl, stale_while_revalidate=300)
     cache_key = f"recent_achievements:{username.lower()}"
 
     cached_data = recent_achievements_cache.get(cache_key)
@@ -388,7 +440,7 @@ async def get_user_recent_achievements(
 
 @app.get(
     "/api/v1/user/{username}/achievements",
-    response_model=List[UserAchievement],
+    response_model=UserAchievementsResponse,
     responses={
         404: {"model": ErrorDetail, "description": "User profile not found"},
         403: {"model": ErrorDetail, "description": "User profile is private"},
@@ -396,31 +448,113 @@ async def get_user_recent_achievements(
     },
     summary="Get every achievement a user has earned, across every game",
     description=(
-        "Every achievement the user has unlocked, across every tracked game, each "
-        "with its name, description, points, rarity, icon, permalink and unlock "
-        "timestamp — sorted most-recently-earned first.\n\n"
-        "**This is slow.** It fans out a catalogue scrape plus an earned-awards "
-        "lookup for every game the user has earned at least one achievement in, "
-        "so an account with hundreds of played games can take many seconds "
-        "(occasionally over a minute) and puts a real load on Exophase's API. "
-        "Prefer GET /api/v1/user/{username}/game/{slug}/achievements for one game, "
-        "or GET /api/v1/user/{username}/recent-achievements for a cheap recent-"
-        "activity feed, when either fits your use case."
+        "Every achievement the user has unlocked, with a top-level `stats` object "
+        "so the client doesn't have to iterate the array just to total things up. "
+        "Each achievement carries its name, description, points, rarity, icon, "
+        "permalink and unlock timestamp.\n\n"
+        "`platform` filters *before* fetching — games on other platforms are "
+        "skipped entirely rather than scraped and discarded, so it's a real "
+        "speedup, not just a smaller response. `sort` and `limit`/`page` are "
+        "applied to the (possibly cached) result afterwards.\n\n"
+        "**Even filtered, this can be slow.** It fans out a catalogue scrape plus "
+        "an earned-awards lookup for every matching game with at least one earned "
+        "achievement, so an unfiltered account with hundreds of played games can "
+        "take many seconds. Prefer GET /api/v1/user/{username}/game/{slug}/achievements "
+        "for one game, or GET /api/v1/user/{username}/recent-achievements for a "
+        "cheap recent-activity feed, when either fits your use case."
     ),
 )
 async def get_user_achievements(
+    response: Response,
+    username: str = Path(..., description="Exophase username (case-insensitive)", min_length=1),
+    platform: Optional[str] = Query(None, description="Restrict to one platform, e.g. 'steam' or 'Google Play' (case-insensitive). Reduces the actual scrape work, not just the response."),
+    sort: str = Query("recent", pattern="^(recent|rarity)$", description="'recent' (default, most-recently-earned first) or 'rarity' (rarest first)."),
+    limit: Optional[int] = Query(None, ge=1, le=200, description="Page size. Omit to return everything."),
+    page: int = Query(1, ge=1, description="1-indexed page, used with `limit`."),
+    scraper: ExophaseScraper = Depends(get_scraper),
+):
+    set_cache_control(response, s_maxage=all_achievements_cache.ttl, stale_while_revalidate=1800)
+    cache_key = f"all_achievements:{username.lower()}:{(platform or 'all').lower()}"
+
+    achievements = all_achievements_cache.get(cache_key)
+    if achievements is None:
+        try:
+            achievements = await scraper.scrape_all_user_achievements(username, platform=platform)
+            all_achievements_cache.set(cache_key, achievements)
+        except UserNotFoundError as e:
+            logger.warning(f"Profile not found for username '{username}': {e}")
+            raise HTTPException(status_code=404, detail=str(e))
+        except PrivateProfileError as e:
+            logger.warning(f"Profile is private for username '{username}': {e}")
+            raise HTTPException(status_code=403, detail=str(e))
+        except ScraperError as e:
+            logger.error(f"Scraper error while fetching all achievements for '{username}': {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to scrape achievements: {e}")
+        except Exception as e:
+            logger.exception(f"Unexpected error while fetching all achievements for '{username}'")
+            raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {e}")
+
+    if sort == "rarity":
+        achievements = sorted(achievements, key=lambda a: a["rarity_percent"])
+    # "recent" is already the scraper's default order.
+
+    # Stats describe the full filtered set, not just the current page.
+    stats = {
+        "total_unlocked": len(achievements),
+        "total_games": len({a["game_slug"] for a in achievements}),
+        "total_points": sum(a.get("points", 0) for a in achievements),
+    }
+
+    if limit:
+        start = (page - 1) * limit
+        page_items = achievements[start:start + limit]
+        has_more = start + limit < len(achievements)
+    else:
+        page_items = achievements
+        has_more = False
+
+    return {
+        "username": username,
+        "stats": stats,
+        "page": page,
+        "limit": limit,
+        "has_more": has_more,
+        "achievements": page_items,
+    }
+
+
+@app.get(
+    "/api/v1/user/{username}/summary",
+    response_model=SummaryResponse,
+    responses={
+        404: {"model": ErrorDetail, "description": "User profile not found"},
+        403: {"model": ErrorDetail, "description": "User profile is private"},
+        500: {"model": ErrorDetail, "description": "Scraper or network failure"},
+    },
+    summary="Get profile, platform breakdown, and recent activity in one call",
+    description=(
+        "A single lightweight round trip for an initial tab/panel load: profile "
+        "info, per-platform stats, and the last few unlocked achievements, all in "
+        "one response. Runs the underlying profile and recent-achievements scrapes "
+        "concurrently, so it's about as fast as the slower of the two alone — not "
+        "the sum of calling both endpoints separately."
+    ),
+)
+async def get_user_summary(
+    response: Response,
     username: str = Path(..., description="Exophase username (case-insensitive)", min_length=1),
     scraper: ExophaseScraper = Depends(get_scraper),
 ):
-    cache_key = f"all_achievements:{username.lower()}"
+    set_cache_control(response, s_maxage=summary_cache.ttl, stale_while_revalidate=600)
+    cache_key = f"summary:{username.lower()}"
 
-    cached_data = all_achievements_cache.get(cache_key)
+    cached_data = summary_cache.get(cache_key)
     if cached_data:
         return cached_data
 
     try:
-        data = await scraper.scrape_all_user_achievements(username)
-        all_achievements_cache.set(cache_key, data)
+        data = await scraper.scrape_summary(username)
+        summary_cache.set(cache_key, data)
         return data
     except UserNotFoundError as e:
         logger.warning(f"Profile not found for username '{username}': {e}")
@@ -429,8 +563,8 @@ async def get_user_achievements(
         logger.warning(f"Profile is private for username '{username}': {e}")
         raise HTTPException(status_code=403, detail=str(e))
     except ScraperError as e:
-        logger.error(f"Scraper error while fetching all achievements for '{username}': {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to scrape achievements: {e}")
+        logger.error(f"Scraper error while fetching summary for '{username}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to scrape summary: {e}")
     except Exception as e:
-        logger.exception(f"Unexpected error while fetching all achievements for '{username}'")
+        logger.exception(f"Unexpected error while fetching summary for '{username}'")
         raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {e}")

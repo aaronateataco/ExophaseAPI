@@ -417,6 +417,20 @@ class ExophaseScraper:
             })
         return out
 
+    async def scrape_summary(self, username: str, recent_limit: int = 5) -> Dict[str, Any]:
+        """
+        Profile info, per-platform breakdown, and the most recent unlocked
+        achievements in one call — for a single initial-load round trip
+        instead of the client firing off `/profile` and
+        `/recent-achievements` separately. Runs both scrapes concurrently.
+        """
+        profile, recent = await asyncio.gather(
+            self.scrape_profile(username),
+            self.scrape_recent_achievements(username, limit=recent_limit),
+        )
+        profile["recent_achievements"] = recent
+        return profile
+
     async def _fetch_earned_map(
         self, client: httpx.AsyncClient, player_id: Optional[int], master_id: Optional[int], total_earned: int
     ) -> Dict[int, Dict[str, Any]]:
@@ -477,7 +491,9 @@ class ExophaseScraper:
             )
         return self._apply_earned(catalogue, earned_by_id)
 
-    async def scrape_all_user_achievements(self, username: str, concurrency: int = 30) -> List[Dict[str, Any]]:
+    async def scrape_all_user_achievements(
+        self, username: str, concurrency: int = 30, platform: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """
         Every achievement the user has actually earned, across every game
         they've played, each with its name, description, points, rarity,
@@ -495,8 +511,21 @@ class ExophaseScraper:
         through Exophase's API — prefer `scrape_user_game_achievements` for
         a single game, or `scrape_recent_achievements` for a cheap recent-
         activity feed, when either fits the use case.
+
+        Passing `platform` (a display name like "Steam" or an environment
+        slug like "steam", case-insensitive) filters *before* fetching, not
+        after — games on other platforms are skipped entirely rather than
+        scraped and discarded, so it's also a real speedup, not just a
+        smaller response.
         """
         games = await self.scrape_games(username)
+        if platform:
+            wanted = platform.strip().lower()
+            wanted_display = _PLATFORM_ENV_MAP.get(wanted, "").lower()
+            games = [
+                g for g in games
+                if g.get("platform", "").lower() == wanted or g.get("platform", "").lower() == wanted_display
+            ]
         playable = [
             g for g in games
             if g.get("earned_awards") and g.get("game_slug") and g.get("player_id") and g.get("master_id")
