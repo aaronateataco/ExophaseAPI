@@ -60,6 +60,8 @@ games_cache = AsyncTTLMemoryCache(ttl_seconds=300)
 # A game's achievement catalogue changes only when the developer ships new
 # ones, so it is cached far longer than the per-user views.
 catalogue_cache = AsyncTTLMemoryCache(ttl_seconds=21600)
+user_game_achievements_cache = AsyncTTLMemoryCache(ttl_seconds=300)
+recent_achievements_cache = AsyncTTLMemoryCache(ttl_seconds=120)
 
 # Scraper Instance Dependency
 def get_scraper() -> ExophaseScraper:
@@ -97,8 +99,10 @@ class GameItem(BaseModel):
     platform: str = Field(..., description="The connected platform (e.g. Steam, PSN, Xbox, RetroAchievements).")
     completion_percentage: float = Field(..., description="Completion rate for this specific game.")
     playtime_hours: float = Field(..., description="Recorded hours of gameplay for this specific game.")
-    game_slug: str = Field(..., description="The unique Exophase URL identifier or slug for the game.")
-    game_url: str = Field(..., description="Direct link to Exophase page for the game.")
+    earned_awards: int = Field(0, description="Achievements/trophies earned by this user in this game.")
+    total_awards: int = Field(0, description="Total achievements/trophies this game has.")
+    game_slug: Optional[str] = Field(None, description="The unique Exophase URL identifier or slug for the game.")
+    game_url: Optional[str] = Field(None, description="Direct link to Exophase page for the game.")
 
 class Achievement(BaseModel):
     id: int = Field(..., description="Exophase's global award id.")
@@ -111,6 +115,20 @@ class Achievement(BaseModel):
     secret: bool = Field(False, description="Hidden until unlocked on the platform.")
     icon_url: Optional[str] = Field(None, description="Direct URL to the 64x64 award icon.")
     url: Optional[str] = Field(None, description="Exophase permalink for the achievement.")
+    earned: bool = Field(False, description="Whether the requesting user has unlocked it. Only set on the per-user endpoint.")
+    earned_at: Optional[str] = Field(None, description="ISO 8601 unlock timestamp. Only set on the per-user endpoint.")
+    earned_at_unix: Optional[int] = Field(None, description="Unix unlock timestamp. Only set on the per-user endpoint.")
+
+class RecentAchievement(BaseModel):
+    id: Optional[int] = Field(None, description="Exophase's internal award id.")
+    name: str = Field(..., description="Achievement display name.")
+    description: str = Field("", description="Achievement description.")
+    rarity_percent: float = Field(0.0, description="Percentage of tracked players who have it.")
+    icon_url: Optional[str] = Field(None, description="Direct URL to the award icon.")
+    url: Optional[str] = Field(None, description="Exophase permalink for the achievement.")
+    earned_at: Optional[str] = Field(None, description="Human-readable unlock time, as Exophase displays it.")
+    game_title: str = Field(..., description="The game this achievement belongs to.")
+    platform: str = Field(..., description="The platform it was earned on.")
 
 class GameAchievements(BaseModel):
     slug: str = Field(..., description="Exophase game slug, platform suffix included.")
@@ -186,7 +204,13 @@ async def get_user_profile(
         500: {"model": ErrorDetail, "description": "Scraper or network failure"},
     },
     summary="Get Exophase Games and Achievements",
-    description="Retrieves a list of games for an Exophase user, including individual completion percentage and playtime."
+    description=(
+        "Retrieves every game tracked for an Exophase user, with per-game completion "
+        "percentage, playtime, and earned/total achievement counts. Pass `game_slug` "
+        "to GET /api/v1/game/{slug}/achievements for that game's full catalogue, or "
+        "to GET /api/v1/user/{username}/game/{slug}/achievements for this user's own "
+        "unlock timestamps."
+    )
 )
 async def get_user_games(
     username: str = Path(..., description="Exophase username (case-insensitive)", min_length=1),
@@ -263,4 +287,93 @@ async def get_game_achievements(
         raise HTTPException(status_code=500, detail=f"Failed to scrape Exophase achievements: {e}")
     except Exception as e:
         logger.exception(f"Unexpected error while fetching achievements for '{slug}'")
+        raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {e}")
+
+
+@app.get(
+    "/api/v1/user/{username}/game/{slug}/achievements",
+    response_model=GameAchievements,
+    responses={
+        404: {"model": ErrorDetail, "description": "User doesn't have this game, or the slug is wrong"},
+        403: {"model": ErrorDetail, "description": "Profile or games list is private"},
+        500: {"model": ErrorDetail, "description": "Scraper or network failure"},
+    },
+    summary="Get a user's achievements for one game, with unlock timestamps",
+    description=(
+        "The full achievement catalogue for one game (name, description, points, "
+        "rarity, icon, url — same as GET /api/v1/game/{slug}/achievements), merged "
+        "with this specific user's `earned` status and `earned_at` unlock timestamp "
+        "for each one."
+    ),
+)
+async def get_user_game_achievements(
+    username: str = Path(..., description="Exophase username (case-insensitive)", min_length=1),
+    slug: str = Path(..., description="Exophase game slug, e.g. hill-climb-racing-android", min_length=1),
+    scraper: ExophaseScraper = Depends(get_scraper),
+):
+    cache_key = f"user_game_achievements:{username.lower()}:{slug.lower()}"
+
+    cached_data = user_game_achievements_cache.get(cache_key)
+    if cached_data:
+        return cached_data
+
+    try:
+        data = await scraper.scrape_user_game_achievements(username, slug)
+        user_game_achievements_cache.set(cache_key, data)
+        return data
+    except UserNotFoundError as e:
+        logger.warning(f"No achievements for '{username}' in game '{slug}': {e}")
+        raise HTTPException(status_code=404, detail=str(e))
+    except PrivateProfileError as e:
+        logger.warning(f"Achievements forbidden for '{username}' in game '{slug}': {e}")
+        raise HTTPException(status_code=403, detail=str(e))
+    except ScraperError as e:
+        logger.error(f"Scraper error for '{username}' in game '{slug}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to scrape Exophase achievements: {e}")
+    except Exception as e:
+        logger.exception(f"Unexpected error while fetching achievements for '{username}' in game '{slug}'")
+        raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {e}")
+
+
+@app.get(
+    "/api/v1/user/{username}/recent-achievements",
+    response_model=List[RecentAchievement],
+    responses={
+        404: {"model": ErrorDetail, "description": "User profile not found"},
+        403: {"model": ErrorDetail, "description": "User profile is private"},
+        500: {"model": ErrorDetail, "description": "Scraper or network failure"},
+    },
+    summary="Get a user's most recently unlocked achievements",
+    description=(
+        "A short feed (Exophase caps it at a handful) of the user's most recently "
+        "earned achievements across every connected platform, each with its icon, "
+        "permalink and unlock time — good for a Discord Rich Presence 'recently "
+        "unlocked' display without needing to know which game it was in."
+    ),
+)
+async def get_user_recent_achievements(
+    username: str = Path(..., description="Exophase username (case-insensitive)", min_length=1),
+    scraper: ExophaseScraper = Depends(get_scraper),
+):
+    cache_key = f"recent_achievements:{username.lower()}"
+
+    cached_data = recent_achievements_cache.get(cache_key)
+    if cached_data:
+        return cached_data
+
+    try:
+        data = await scraper.scrape_recent_achievements(username)
+        recent_achievements_cache.set(cache_key, data)
+        return data
+    except UserNotFoundError as e:
+        logger.warning(f"Profile not found for username '{username}': {e}")
+        raise HTTPException(status_code=404, detail=str(e))
+    except PrivateProfileError as e:
+        logger.warning(f"Profile is private for username '{username}': {e}")
+        raise HTTPException(status_code=403, detail=str(e))
+    except ScraperError as e:
+        logger.error(f"Scraper error while fetching recent achievements for '{username}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to scrape recent achievements: {e}")
+    except Exception as e:
+        logger.exception(f"Unexpected error while fetching recent achievements for '{username}'")
         raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {e}")

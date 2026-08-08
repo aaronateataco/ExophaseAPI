@@ -1,5 +1,6 @@
 import re
 import logging
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 import httpx
 from bs4 import BeautifulSoup, Tag
@@ -52,14 +53,20 @@ class ExophaseScraper:
     -----
     * The games list is loaded entirely via a Cloudflare-protected JSON API
       and a Vue.js SPA — it is not available in static HTML and cannot be
-      reached by a plain HTTP client.  The `scrape_games` method raises
-      `NotSupportedError` with a descriptive message.
+      reached by a plain HTTP client.  It IS reachable via the private
+      `api.exophase.com` JSON API the site's own Vue frontend calls
+      (`GET /public/player/{playerid}/games`, `/awards`, and
+      `/game/{master_id}/earned`) — no headless browser needed, just the
+      right endpoint and headers.  `scrape_games` and
+      `scrape_user_game_achievements` use it.
     * Profile data IS present in the server-rendered HTML and is fully
       supported.
     """
 
     def __init__(self, timeout: float = 15.0):
         self.base_url = "https://www.exophase.com"
+        self.api_base_url = "https://api.exophase.com"
+        self.media_base_url = "https://m.exophase.com"
         # Modern browser headers to avoid trivial bot-detection blocks
         self.headers = {
             "User-Agent": (
@@ -73,6 +80,13 @@ class ExophaseScraper:
             ),
             "Accept-Language": "en-US,en;q=0.5",
             "Referer": "https://www.exophase.com/",
+        }
+        # The JSON API rejects requests that don't look like the site's own
+        # XHR calls.
+        self.api_headers = {
+            **self.headers,
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
         }
         self.timeout = timeout
 
@@ -101,6 +115,39 @@ class ExophaseScraper:
             raise ScraperError(f"HTTP error: {e}")
         except httpx.RequestError as e:
             raise ScraperError(f"Network request failed: {e}")
+
+    async def _get_json(
+        self, client: httpx.AsyncClient, url: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Fetch from the private api.exophase.com JSON API."""
+        try:
+            response = await client.get(
+                url, headers=self.api_headers, params=params,
+                timeout=self.timeout, follow_redirects=True,
+            )
+            if response.status_code == 404:
+                raise UserNotFoundError(f"Not found at: {url}")
+            if response.status_code == 403:
+                raise PrivateProfileError(f"Access forbidden at: {url}")
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise UserNotFoundError(f"Not found at: {url}")
+            elif e.response.status_code == 403:
+                raise PrivateProfileError(f"Access forbidden at: {url}")
+            raise ScraperError(f"HTTP error: {e}")
+        except httpx.RequestError as e:
+            raise ScraperError(f"Network request failed: {e}")
+
+    @staticmethod
+    def _slug_from_endpoint(endpoint_url: Optional[str]) -> Optional[str]:
+        """Pull the game slug out of an endpoint_awards URL like
+        'https://www.exophase.com/game/brotato-steam/achievements/#123'."""
+        if not endpoint_url:
+            return None
+        m = re.search(r"/game/([^/]+)/achievements", endpoint_url)
+        return m.group(1) if m else None
 
     @staticmethod
     def _extract_first_number(text: str) -> str:
@@ -274,25 +321,163 @@ class ExophaseScraper:
             "profile_url": url,
         }
 
+    async def _resolve_master_playerid(self, client: httpx.AsyncClient, username: str) -> str:
+        """Look up a username's global (cross-platform) player id from their
+        profile page — required by every api.exophase.com call below."""
+        url = f"{self.base_url}/user/{username}/"
+        html = await self._get_html(client, url)
+        soup = BeautifulSoup(html, "html.parser")
+        header = soup.select_one("div.user-header.global[data-playerid]")
+        if not header or not header.get("data-playerid"):
+            raise UserNotFoundError(f"Could not resolve a player id for '{username}'.")
+        return header["data-playerid"]
+
     async def scrape_games(self, username: str) -> List[Dict[str, Any]]:
         """
-        NOT SUPPORTED — Exophase's game list is served exclusively through a
-        Cloudflare-protected JSON API consumed by a Vue.js SPA.  A plain HTTP
-        scraper cannot pass the JS challenge and therefore cannot retrieve game
-        data.
+        Scrape a user's full games list via the private
+        `GET /public/player/{playerid}/games` endpoint the site's own Vue
+        frontend uses.  Despite being served through a Cloudflare-fronted
+        API, it responds to a plain HTTP client as long as it's called with
+        the same headers a browser XHR would send — no headless browser
+        required.
+        """
+        # The endpoint paginates at 50 games/page with no total-count field,
+        # so keep requesting pages until one comes back short.
+        raw_games: List[Dict[str, Any]] = []
+        async with httpx.AsyncClient() as client:
+            master_playerid = await self._resolve_master_playerid(client, username)
+            page = 1
+            while True:
+                data = await self._get_json(
+                    client,
+                    f"{self.api_base_url}/public/player/{master_playerid}/games",
+                    params={"page": page},
+                )
+                page_games = data.get("games", [])
+                raw_games.extend(page_games)
+                if len(page_games) < 50 or page >= 50:
+                    break
+                page += 1
+
+        games: List[Dict[str, Any]] = []
+        for g in raw_games:
+            meta = g.get("meta", {})
+            units = g.get("playtimeUnits", {}) or {}
+            playtime_hours = round((units.get("hours", 0) or 0) + (units.get("minutes", 0) or 0) / 60, 2)
+            env = meta.get("environment_slug", "")
+            games.append({
+                "game_title": meta.get("title", ""),
+                "platform": _PLATFORM_ENV_MAP.get(env, env.capitalize() if env else ""),
+                "completion_percentage": g.get("percent") or 0.0,
+                "playtime_hours": playtime_hours,
+                "earned_awards": g.get("earned_awards") or 0,
+                "total_awards": g.get("total_awards") or meta.get("total_awards") or 0,
+                "game_slug": self._slug_from_endpoint(meta.get("endpoint_awards")),
+                "game_url": meta.get("endpoint_awards"),
+                # Needed to fetch this game's earned-achievement timestamps —
+                # NOT the same as the global master_playerid; the API reuses
+                # the field name per-platform in this response.
+                "player_id": g.get("master_playerid"),
+                "master_id": g.get("master_id"),
+            })
+        return games
+
+    async def scrape_recent_achievements(self, username: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Scrape the user's most recently earned achievements across every
+        connected platform, via `GET /public/player/{playerid}/awards`.
+
+        Each entry carries the earned timestamp (as Exophase displays it —
+        the API doesn't expose a raw unix time here), icon, permalink and
+        the game it belongs to.  The endpoint only ever returns a handful
+        of the most recent unlocks — for a specific game's full history use
+        `scrape_user_game_achievements` instead.
+        """
+        async with httpx.AsyncClient() as client:
+            master_playerid = await self._resolve_master_playerid(client, username)
+            data = await self._get_json(
+                client, f"{self.api_base_url}/public/player/{master_playerid}/awards"
+            )
+
+        out: List[Dict[str, Any]] = []
+        for a in data.get("awards", [])[:limit]:
+            meta = a.get("meta", {}) or {}
+            endpoint = a.get("endpoint")
+            out.append({
+                "id":            a.get("internal_award_id"),
+                "name":          a.get("name", ""),
+                "description":   a.get("description", ""),
+                "rarity_percent": self._parse_float(a.get("average") or "0"),
+                "icon_url":      a.get("image"),
+                "url":           f"{self.base_url}{endpoint}" if endpoint else None,
+                "earned_at":     a.get("earned"),
+                "game_title":    meta.get("title", ""),
+                "platform":      _PLATFORM_ENV_MAP.get(meta.get("environment_slug", ""), meta.get("environment_slug", "")),
+            })
+        return out
+
+    async def scrape_user_game_achievements(self, username: str, slug: str) -> Dict[str, Any]:
+        """
+        A single game's full achievement catalogue (name, description,
+        points, rarity, icon, url — from the server-rendered catalogue page)
+        merged with this user's own earned status and unlock timestamp for
+        each one, pulled from `GET /public/player/{playerid}/game/{master_id}/earned`.
 
         Raises
         ------
-        NotSupportedError
-            Always, with a descriptive message.
+        UserNotFoundError
+            The user doesn't have this game (wrong slug, or never played it).
         """
-        raise NotSupportedError(
-            "The Exophase games list is loaded dynamically via a Cloudflare-protected "
-            "API endpoint (api.exophase.com) that requires JavaScript execution to "
-            "access.  A server-side HTML scraper cannot retrieve this data without a "
-            "headless browser (e.g. Playwright or Selenium).  Profile data is still "
-            "fully available via GET /api/v1/user/{username}/profile."
+        async with httpx.AsyncClient() as client:
+            master_playerid = await self._resolve_master_playerid(client, username)
+            games_data = await self._get_json(
+                client, f"{self.api_base_url}/public/player/{master_playerid}/games"
+            )
+
+        game_entry = next(
+            (
+                g for g in games_data.get("games", [])
+                if self._slug_from_endpoint((g.get("meta") or {}).get("endpoint_awards")) == slug
+            ),
+            None,
         )
+        if game_entry is None:
+            raise UserNotFoundError(f"'{username}' has no tracked game with slug '{slug}'.")
+
+        player_id = game_entry.get("master_playerid")
+        master_id = game_entry.get("master_id")
+        total_earned = game_entry.get("earned_awards") or 0
+
+        catalogue = await self.scrape_game_achievements(slug)
+
+        earned_by_id: Dict[int, Dict[str, Any]] = {}
+        if player_id and master_id and total_earned:
+            async with httpx.AsyncClient() as client:
+                earned_data = await self._get_json(
+                    client,
+                    f"{self.api_base_url}/public/player/{player_id}/game/{master_id}/earned",
+                    params={"limit": max(total_earned, 1)},
+                )
+            for item in earned_data.get("list", []):
+                award_id = item.get("masterAwardId")
+                if award_id is not None:
+                    earned_by_id[award_id] = item
+
+        for achievement in catalogue["achievements"]:
+            earned = earned_by_id.get(achievement["id"])
+            if earned:
+                ts = earned.get("timestamp")
+                achievement["earned"] = True
+                achievement["earned_at_unix"] = ts
+                achievement["earned_at"] = (
+                    datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
+                )
+            else:
+                achievement["earned"] = False
+                achievement["earned_at_unix"] = None
+                achievement["earned_at"] = None
+
+        return catalogue
 
     # ------------------------------------------------------------------
     # Game achievement catalogue
