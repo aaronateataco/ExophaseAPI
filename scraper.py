@@ -1,4 +1,5 @@
 import re
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
@@ -416,53 +417,27 @@ class ExophaseScraper:
             })
         return out
 
-    async def scrape_user_game_achievements(self, username: str, slug: str) -> Dict[str, Any]:
-        """
-        A single game's full achievement catalogue (name, description,
-        points, rarity, icon, url — from the server-rendered catalogue page)
-        merged with this user's own earned status and unlock timestamp for
-        each one, pulled from `GET /public/player/{playerid}/game/{master_id}/earned`.
-
-        Raises
-        ------
-        UserNotFoundError
-            The user doesn't have this game (wrong slug, or never played it).
-        """
-        async with httpx.AsyncClient() as client:
-            master_playerid = await self._resolve_master_playerid(client, username)
-            games_data = await self._get_json(
-                client, f"{self.api_base_url}/public/player/{master_playerid}/games"
-            )
-
-        game_entry = next(
-            (
-                g for g in games_data.get("games", [])
-                if self._slug_from_endpoint((g.get("meta") or {}).get("endpoint_awards")) == slug
-            ),
-            None,
-        )
-        if game_entry is None:
-            raise UserNotFoundError(f"'{username}' has no tracked game with slug '{slug}'.")
-
-        player_id = game_entry.get("master_playerid")
-        master_id = game_entry.get("master_id")
-        total_earned = game_entry.get("earned_awards") or 0
-
-        catalogue = await self.scrape_game_achievements(slug)
-
+    async def _fetch_earned_map(
+        self, client: httpx.AsyncClient, player_id: Optional[int], master_id: Optional[int], total_earned: int
+    ) -> Dict[int, Dict[str, Any]]:
+        """`{masterAwardId: earned-item}` for one game, via the earned-awards API."""
         earned_by_id: Dict[int, Dict[str, Any]] = {}
-        if player_id and master_id and total_earned:
-            async with httpx.AsyncClient() as client:
-                earned_data = await self._get_json(
-                    client,
-                    f"{self.api_base_url}/public/player/{player_id}/game/{master_id}/earned",
-                    params={"limit": max(total_earned, 1)},
-                )
-            for item in earned_data.get("list", []):
-                award_id = item.get("masterAwardId")
-                if award_id is not None:
-                    earned_by_id[award_id] = item
+        if not (player_id and master_id and total_earned):
+            return earned_by_id
+        earned_data = await self._get_json(
+            client,
+            f"{self.api_base_url}/public/player/{player_id}/game/{master_id}/earned",
+            params={"limit": max(total_earned, 1)},
+        )
+        for item in earned_data.get("list", []):
+            award_id = item.get("masterAwardId")
+            if award_id is not None:
+                earned_by_id[award_id] = item
+        return earned_by_id
 
+    @staticmethod
+    def _apply_earned(catalogue: Dict[str, Any], earned_by_id: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+        """Stamp `earned` / `earned_at` / `earned_at_unix` onto each catalogue achievement in place."""
         for achievement in catalogue["achievements"]:
             earned = earned_by_id.get(achievement["id"])
             if earned:
@@ -476,8 +451,82 @@ class ExophaseScraper:
                 achievement["earned"] = False
                 achievement["earned_at_unix"] = None
                 achievement["earned_at"] = None
-
         return catalogue
+
+    async def scrape_user_game_achievements(self, username: str, slug: str) -> Dict[str, Any]:
+        """
+        A single game's full achievement catalogue (name, description,
+        points, rarity, icon, url — from the server-rendered catalogue page)
+        merged with this user's own earned status and unlock timestamp for
+        each one, pulled from `GET /public/player/{playerid}/game/{master_id}/earned`.
+
+        Raises
+        ------
+        UserNotFoundError
+            The user doesn't have this game (wrong slug, or never played it).
+        """
+        games = await self.scrape_games(username)
+        game_entry = next((g for g in games if g.get("game_slug") == slug), None)
+        if game_entry is None:
+            raise UserNotFoundError(f"'{username}' has no tracked game with slug '{slug}'.")
+
+        catalogue = await self.scrape_game_achievements(slug)
+        async with httpx.AsyncClient() as client:
+            earned_by_id = await self._fetch_earned_map(
+                client, game_entry.get("player_id"), game_entry.get("master_id"), game_entry.get("earned_awards") or 0
+            )
+        return self._apply_earned(catalogue, earned_by_id)
+
+    async def scrape_all_user_achievements(self, username: str, concurrency: int = 8) -> List[Dict[str, Any]]:
+        """
+        Every achievement the user has actually earned, across every game
+        they've played, each with its name, description, points, rarity,
+        icon, permalink and unlock timestamp.
+
+        This fans out one catalogue scrape + one earned-awards API call per
+        game that has at least one earned achievement (games with zero
+        earned awards are skipped — nothing to report), bounded by
+        `concurrency` concurrent requests. For an account with hundreds of
+        played games this is genuinely slow (many seconds, potentially over
+        a minute) and puts a meaningful number of requests through
+        Exophase's API — prefer `scrape_user_game_achievements` for a single
+        game, or `scrape_recent_achievements` for a cheap recent-activity
+        feed, when either fits the use case.
+        """
+        games = await self.scrape_games(username)
+        playable = [
+            g for g in games
+            if g.get("earned_awards") and g.get("game_slug") and g.get("player_id") and g.get("master_id")
+        ]
+
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def fetch_one(client: httpx.AsyncClient, game: Dict[str, Any]) -> List[Dict[str, Any]]:
+            async with semaphore:
+                try:
+                    catalogue = await self.scrape_game_achievements(game["game_slug"])
+                    earned_by_id = await self._fetch_earned_map(
+                        client, game["player_id"], game["master_id"], game["earned_awards"]
+                    )
+                except ScraperError:
+                    return []
+            merged = self._apply_earned(catalogue, earned_by_id)
+            out = []
+            for achievement in merged["achievements"]:
+                if achievement["earned"]:
+                    entry = dict(achievement)
+                    entry["game_title"] = merged["title"]
+                    entry["game_slug"] = merged["slug"]
+                    entry["platform"] = game["platform"]
+                    out.append(entry)
+            return out
+
+        async with httpx.AsyncClient() as client:
+            results = await asyncio.gather(*(fetch_one(client, g) for g in playable))
+
+        all_earned: List[Dict[str, Any]] = [entry for page in results for entry in page]
+        all_earned.sort(key=lambda a: a.get("earned_at_unix") or 0, reverse=True)
+        return all_earned
 
     # ------------------------------------------------------------------
     # Game achievement catalogue

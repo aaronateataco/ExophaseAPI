@@ -62,6 +62,8 @@ games_cache = AsyncTTLMemoryCache(ttl_seconds=300)
 catalogue_cache = AsyncTTLMemoryCache(ttl_seconds=21600)
 user_game_achievements_cache = AsyncTTLMemoryCache(ttl_seconds=300)
 recent_achievements_cache = AsyncTTLMemoryCache(ttl_seconds=120)
+# Expensive to build (fans out across every played game) — cached longest.
+all_achievements_cache = AsyncTTLMemoryCache(ttl_seconds=900)
 
 # Scraper Instance Dependency
 def get_scraper() -> ExophaseScraper:
@@ -118,6 +120,11 @@ class Achievement(BaseModel):
     earned: bool = Field(False, description="Whether the requesting user has unlocked it. Only set on the per-user endpoint.")
     earned_at: Optional[str] = Field(None, description="ISO 8601 unlock timestamp. Only set on the per-user endpoint.")
     earned_at_unix: Optional[int] = Field(None, description="Unix unlock timestamp. Only set on the per-user endpoint.")
+
+class UserAchievement(Achievement):
+    game_title: str = Field(..., description="The game this achievement belongs to.")
+    game_slug: str = Field(..., description="Exophase game slug it belongs to.")
+    platform: str = Field(..., description="The platform it was earned on.")
 
 class RecentAchievement(BaseModel):
     id: Optional[int] = Field(None, description="Exophase's internal award id.")
@@ -376,4 +383,54 @@ async def get_user_recent_achievements(
         raise HTTPException(status_code=500, detail=f"Failed to scrape recent achievements: {e}")
     except Exception as e:
         logger.exception(f"Unexpected error while fetching recent achievements for '{username}'")
+        raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {e}")
+
+
+@app.get(
+    "/api/v1/user/{username}/achievements",
+    response_model=List[UserAchievement],
+    responses={
+        404: {"model": ErrorDetail, "description": "User profile not found"},
+        403: {"model": ErrorDetail, "description": "User profile is private"},
+        500: {"model": ErrorDetail, "description": "Scraper or network failure"},
+    },
+    summary="Get every achievement a user has earned, across every game",
+    description=(
+        "Every achievement the user has unlocked, across every tracked game, each "
+        "with its name, description, points, rarity, icon, permalink and unlock "
+        "timestamp — sorted most-recently-earned first.\n\n"
+        "**This is slow.** It fans out a catalogue scrape plus an earned-awards "
+        "lookup for every game the user has earned at least one achievement in, "
+        "so an account with hundreds of played games can take many seconds "
+        "(occasionally over a minute) and puts a real load on Exophase's API. "
+        "Prefer GET /api/v1/user/{username}/game/{slug}/achievements for one game, "
+        "or GET /api/v1/user/{username}/recent-achievements for a cheap recent-"
+        "activity feed, when either fits your use case."
+    ),
+)
+async def get_user_achievements(
+    username: str = Path(..., description="Exophase username (case-insensitive)", min_length=1),
+    scraper: ExophaseScraper = Depends(get_scraper),
+):
+    cache_key = f"all_achievements:{username.lower()}"
+
+    cached_data = all_achievements_cache.get(cache_key)
+    if cached_data:
+        return cached_data
+
+    try:
+        data = await scraper.scrape_all_user_achievements(username)
+        all_achievements_cache.set(cache_key, data)
+        return data
+    except UserNotFoundError as e:
+        logger.warning(f"Profile not found for username '{username}': {e}")
+        raise HTTPException(status_code=404, detail=str(e))
+    except PrivateProfileError as e:
+        logger.warning(f"Profile is private for username '{username}': {e}")
+        raise HTTPException(status_code=403, detail=str(e))
+    except ScraperError as e:
+        logger.error(f"Scraper error while fetching all achievements for '{username}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to scrape achievements: {e}")
+    except Exception as e:
+        logger.exception(f"Unexpected error while fetching all achievements for '{username}'")
         raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {e}")
