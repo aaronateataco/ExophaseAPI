@@ -216,6 +216,51 @@ class ExophaseScraper:
             if display:
                 platforms.append(display)
 
+        # ── 6. Per-platform breakdown ──────────────────────────────────
+        # Each linked platform gets its own
+        # <section class="row align-items-center {env}"> block (the first
+        # such section, class "...global", is the aggregate already parsed
+        # above), carrying that platform's own username, completion %,
+        # playtime, achievements earned, games owned and global rank.
+        platform_stats: List[Dict[str, Any]] = []
+        for section in soup.select("section.row.align-items-center"):
+            classes = section.get("class") or []
+            env = next((c for c in classes if c not in ("row", "align-items-center")), None)
+            if not env or env == "global":
+                continue
+
+            display = _PLATFORM_ENV_MAP.get(env, env.capitalize())
+
+            username_el = section.select_one(".column-username h2")
+            platform_username = username_el.get_text(strip=True) if username_el else None
+
+            pct_el = section.select_one(".percentage-label")
+            platform_completion = self._parse_percentage(pct_el.get_text()) if pct_el else 0.0
+
+            playtime_el = section.select_one("span.playtime")
+            platform_playtime = self._parse_float(self._direct_text(playtime_el)) if playtime_el else 0.0
+
+            total_el = section.select_one(
+                'span.total-value[data-tippy-content="Total Trophies and Achievements Earned"]'
+            )
+            platform_achievements = self._parse_int(self._direct_text(total_el)) if total_el else 0
+
+            games_el = section.select_one('span[data-tippy-content="Games Owned"]')
+            games_owned = self._parse_int(self._direct_text(games_el)) if games_el else 0
+
+            rank_el = section.select_one(".global-ranking")
+            global_rank = self._parse_int(rank_el.get_text()) if rank_el else None
+
+            platform_stats.append({
+                "platform": display,
+                "platform_username": platform_username,
+                "completion_percentage": platform_completion,
+                "playtime_hours": platform_playtime,
+                "achievements_earned": platform_achievements,
+                "games_owned": games_owned,
+                "global_rank": global_rank,
+            })
+
         return {
             "username": username,
             "profile_picture_url": pfp_url,
@@ -225,6 +270,7 @@ class ExophaseScraper:
                 "overall_completion_percentage": completion_percentage,
             },
             "connected_platforms": platforms,
+            "platforms": platform_stats,
             "profile_url": url,
         }
 

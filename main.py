@@ -73,11 +73,23 @@ class StatsModel(BaseModel):
     total_playtime_hours: float = Field(..., description="Total recorded playtime hours.")
     overall_completion_percentage: float = Field(..., description="The user's aggregate completion percentage.")
 
+class PlatformStats(BaseModel):
+    platform: str = Field(..., description="Display name of the connected platform, e.g. Steam, RetroAchievements.")
+    platform_username: Optional[str] = Field(None, description="The user's username/gamertag on this specific platform.")
+    completion_percentage: float = Field(..., description="Completion percentage on this platform.")
+    playtime_hours: float = Field(..., description="Cumulative recorded playtime hours on this platform, if tracked.")
+    achievements_earned: int = Field(..., description="Total trophies/achievements earned on this platform.")
+    games_owned: int = Field(..., description="Number of games owned/tracked on this platform.")
+    global_rank: Optional[int] = Field(None, description="Exophase global leaderboard rank for this platform, if shown.")
+
 class ProfileResponse(BaseModel):
     username: str = Field(..., description="The user's Exophase username.")
     profile_picture_url: Optional[str] = Field(None, description="Direct URL to the user's profile avatar image.")
     stats: StatsModel = Field(..., description="Aggregated gamer statistics.")
     connected_platforms: List[str] = Field(..., description="List of verified gaming networks connected to Exophase.")
+    platforms: List[PlatformStats] = Field(
+        ..., description="Per-platform breakdown: username, completion, playtime, achievements and rank on each connected platform."
+    )
     profile_url: str = Field(..., description="Direct link to the Exophase profile page.")
 
 class GameItem(BaseModel):
