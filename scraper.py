@@ -375,6 +375,7 @@ class ExophaseScraper:
                 "total_awards": g.get("total_awards") or meta.get("total_awards") or 0,
                 "game_slug": self._slug_from_endpoint(meta.get("endpoint_awards")),
                 "game_url": meta.get("endpoint_awards"),
+                "lastplayed_unix": g.get("lastplayed") or 0,
                 # Needed to fetch this game's earned-achievement timestamps —
                 # NOT the same as the global master_playerid; the API reuses
                 # the field name per-platform in this response.
@@ -417,16 +418,28 @@ class ExophaseScraper:
             })
         return out
 
-    async def scrape_summary(self, username: str, recent_limit: int = 5) -> Dict[str, Any]:
+    async def scrape_summary(self, username: str, recent_limit: int = 20) -> Dict[str, Any]:
         """
-        Profile info, per-platform breakdown, and the most recent unlocked
+        Profile info, per-platform breakdown, and the most recently unlocked
         achievements in one call — for a single initial-load round trip
-        instead of the client firing off `/profile` and
-        `/recent-achievements` separately. Runs both scrapes concurrently.
+        instead of the client firing off `/profile` and a recent-achievements
+        lookup separately.
+
+        `recent_limit` beyond 5 uses `scrape_recent_achievements_wide`
+        (a bounded scan of recently-played games) rather than Exophase's own
+        recent-awards widget, which is hard-capped at 5 — so this is
+        noticeably heavier than the old 5-item version, though still much
+        lighter than `scrape_all_user_achievements`. The two scrapes run
+        concurrently either way.
         """
+        recent_scrape = (
+            self.scrape_recent_achievements(username, limit=recent_limit)
+            if recent_limit <= 5
+            else self.scrape_recent_achievements_wide(username, limit=recent_limit)
+        )
         profile, recent = await asyncio.gather(
             self.scrape_profile(username),
-            self.scrape_recent_achievements(username, limit=recent_limit),
+            recent_scrape,
         )
         profile["recent_achievements"] = recent
         return profile
@@ -491,46 +504,17 @@ class ExophaseScraper:
             )
         return self._apply_earned(catalogue, earned_by_id)
 
-    async def scrape_all_user_achievements(
-        self, username: str, concurrency: int = 30, platform: Optional[str] = None
+    async def _fetch_earned_for_games(
+        self, playable: List[Dict[str, Any]], concurrency: int
     ) -> List[Dict[str, Any]]:
         """
-        Every achievement the user has actually earned, across every game
-        they've played, each with its name, description, points, rarity,
-        icon, permalink and unlock timestamp.
-
-        This fans out one catalogue scrape + one earned-awards API call per
-        game that has at least one earned achievement (games with zero
-        earned awards are skipped — nothing to report), bounded by
-        `concurrency` concurrent requests and all sharing one pooled HTTP
-        client, so games don't each pay for a fresh TLS handshake, with the
-        catalogue fetch and the earned-awards fetch for each game running
-        concurrently rather than back-to-back. For an account with hundreds
-        of played games this is still genuinely slow (several seconds,
-        potentially more) and puts a meaningful number of requests
-        through Exophase's API — prefer `scrape_user_game_achievements` for
-        a single game, or `scrape_recent_achievements` for a cheap recent-
-        activity feed, when either fits the use case.
-
-        Passing `platform` (a display name like "Steam" or an environment
-        slug like "steam", case-insensitive) filters *before* fetching, not
-        after — games on other platforms are skipped entirely rather than
-        scraped and discarded, so it's also a real speedup, not just a
-        smaller response.
+        For each game in `playable` (must carry game_slug/player_id/master_id/
+        earned_awards), scrape its catalogue and merge in this user's earned
+        status, returning a flat list of just the earned achievements —
+        newest-unlock-first. Shared by `scrape_all_user_achievements` (fed
+        every playable game) and `scrape_recent_achievements_wide` (fed a
+        small recently-played subset, for speed).
         """
-        games = await self.scrape_games(username)
-        if platform:
-            wanted = platform.strip().lower()
-            wanted_display = _PLATFORM_ENV_MAP.get(wanted, "").lower()
-            games = [
-                g for g in games
-                if g.get("platform", "").lower() == wanted or g.get("platform", "").lower() == wanted_display
-            ]
-        playable = [
-            g for g in games
-            if g.get("earned_awards") and g.get("game_slug") and g.get("player_id") and g.get("master_id")
-        ]
-
         semaphore = asyncio.Semaphore(concurrency)
 
         async def fetch_one(client: httpx.AsyncClient, game: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -562,6 +546,77 @@ class ExophaseScraper:
         all_earned: List[Dict[str, Any]] = [entry for page in results for entry in page]
         all_earned.sort(key=lambda a: a.get("earned_at_unix") or 0, reverse=True)
         return all_earned
+
+    @staticmethod
+    def _playable_games(games: List[Dict[str, Any]], platform: Optional[str] = None) -> List[Dict[str, Any]]:
+        if platform:
+            wanted = platform.strip().lower()
+            wanted_display = _PLATFORM_ENV_MAP.get(wanted, "").lower()
+            games = [
+                g for g in games
+                if g.get("platform", "").lower() == wanted or g.get("platform", "").lower() == wanted_display
+            ]
+        return [
+            g for g in games
+            if g.get("earned_awards") and g.get("game_slug") and g.get("player_id") and g.get("master_id")
+        ]
+
+    async def scrape_all_user_achievements(
+        self, username: str, concurrency: int = 30, platform: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Every achievement the user has actually earned, across every game
+        they've played, each with its name, description, points, rarity,
+        icon, permalink and unlock timestamp.
+
+        This fans out one catalogue scrape + one earned-awards API call per
+        game that has at least one earned achievement (games with zero
+        earned awards are skipped — nothing to report), bounded by
+        `concurrency` concurrent requests and all sharing one pooled HTTP
+        client, so games don't each pay for a fresh TLS handshake, with the
+        catalogue fetch and the earned-awards fetch for each game running
+        concurrently rather than back-to-back. For an account with hundreds
+        of played games this is still genuinely slow (several seconds,
+        potentially more) and puts a meaningful number of requests
+        through Exophase's API — prefer `scrape_user_game_achievements` for
+        a single game, or `scrape_recent_achievements_wide` for a bounded
+        recent-activity feed, when either fits the use case.
+
+        Passing `platform` (a display name like "Steam" or an environment
+        slug like "steam", case-insensitive) filters *before* fetching, not
+        after — games on other platforms are skipped entirely rather than
+        scraped and discarded, so it's also a real speedup, not just a
+        smaller response.
+        """
+        games = await self.scrape_games(username)
+        playable = self._playable_games(games, platform)
+        return await self._fetch_earned_for_games(playable, concurrency)
+
+    async def scrape_recent_achievements_wide(
+        self, username: str, limit: int = 20, lookback_games: int = 15
+    ) -> List[Dict[str, Any]]:
+        """
+        A larger recent-activity feed than `scrape_recent_achievements`
+        (which is hard-capped at 5 by Exophase's own widget endpoint), built
+        by scraping only the `lookback_games` most-recently-*played* games
+        with earned achievements — not every game the user owns — and
+        returning the newest `limit` unlocks from that set.
+
+        This is an approximation: it assumes recently-earned achievements
+        come from recently-played games, which holds in the overwhelming
+        majority of cases but can in principle miss an achievement earned in
+        a game the user hasn't touched since (e.g. a delayed platform sync).
+        For a guaranteed-complete answer use `scrape_all_user_achievements`
+        and take the head of the list — but that scrapes every played game,
+        so it's far slower for this same "what did they unlock recently"
+        question.
+        """
+        games = await self.scrape_games(username)
+        playable = self._playable_games(games)
+        playable.sort(key=lambda g: g.get("lastplayed_unix") or 0, reverse=True)
+        candidates = playable[:lookback_games]
+        earned = await self._fetch_earned_for_games(candidates, concurrency=len(candidates) or 1)
+        return earned[:limit]
 
     # ------------------------------------------------------------------
     # Game achievement catalogue

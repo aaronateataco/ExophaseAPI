@@ -64,8 +64,9 @@ user_game_achievements_cache = AsyncTTLMemoryCache(ttl_seconds=300)
 recent_achievements_cache = AsyncTTLMemoryCache(ttl_seconds=120)
 # Expensive to build (fans out across every played game) — cached longest.
 all_achievements_cache = AsyncTTLMemoryCache(ttl_seconds=900)
-# Cheap: one profile-page fetch + one recent-awards call, run concurrently.
-summary_cache = AsyncTTLMemoryCache(ttl_seconds=180)
+# Now scans the ~15 most-recently-played games for the 20-badge feed, so
+# it's heavier than a single profile fetch — cached a bit longer than before.
+summary_cache = AsyncTTLMemoryCache(ttl_seconds=300)
 
 # Scraper Instance Dependency
 def get_scraper() -> ExophaseScraper:
@@ -533,11 +534,15 @@ async def get_user_achievements(
     },
     summary="Get profile, platform breakdown, and recent activity in one call",
     description=(
-        "A single lightweight round trip for an initial tab/panel load: profile "
-        "info, per-platform stats, and the last few unlocked achievements, all in "
-        "one response. Runs the underlying profile and recent-achievements scrapes "
-        "concurrently, so it's about as fast as the slower of the two alone — not "
-        "the sum of calling both endpoints separately."
+        "A single round trip for an initial tab/panel load: profile info, "
+        "per-platform stats, and the 20 most recently unlocked achievements "
+        "(name, description, points, rarity, icon, permalink, unlock time), all "
+        "in one response. Runs the profile scrape and the recent-achievements "
+        "scan concurrently, so it's about as fast as the slower of the two alone "
+        "— not the sum of doing both separately. The 20-badge feed scans the "
+        "user's ~15 most-recently-played games rather than every game they own, "
+        "so this is heavier than a plain profile fetch but far lighter than "
+        "GET /api/v1/user/{username}/achievements."
     ),
 )
 async def get_user_summary(
