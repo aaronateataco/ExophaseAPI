@@ -1,3 +1,4 @@
+import re
 import time
 import logging
 from typing import List, Dict, Tuple, Any, Optional
@@ -579,9 +580,20 @@ async def get_user_summary(
 # --------------------------------------------------------------------------
 # Discord <-> Exophase link management
 # --------------------------------------------------------------------------
+DISCORD_ID_PATTERN = re.compile(r"^\d{15,25}$")
+
+
 class LinkModel(BaseModel):
     discord_id: str = Field(..., description="Discord user ID as a string")
-    exophase_username: str = Field(..., description="Exophase username to associate")
+    exophase_username: str = Field(
+        ..., min_length=1, max_length=64,
+        description="Exophase username to associate"
+    )
+
+
+class LinkResponse(BaseModel):
+    discord_id: str = Field(..., description="The Discord user's snowflake ID.")
+    exophase_username: str = Field(..., description="The linked Exophase username.")
 
 
 @app.get(
@@ -597,39 +609,86 @@ async def list_links():
 
 @app.get(
     "/api/v1/link/{discord_id}",
+    response_model=LinkResponse,
+    responses={
+        404: {"model": ErrorDetail, "description": "No Exophase account linked to this Discord ID"},
+        500: {"model": ErrorDetail, "description": "Failed to read the links database"},
+    },
     summary="Get the Exophase username linked to a Discord ID",
 )
 async def get_link_endpoint(discord_id: str = Path(..., description="Discord ID to look up")):
     try:
         username = await get_link(discord_id)
-        if username is None:
-            raise HTTPException(status_code=404, detail="No link found for that Discord ID")
-        return {"discord_id": discord_id, "exophase_username": username}
     except LinksStoreError as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    if username is None:
+        raise HTTPException(status_code=404, detail="No link found for that Discord ID")
+    return {"discord_id": discord_id, "exophase_username": username}
 
 
 @app.post(
     "/api/v1/link",
+    response_model=LinkResponse,
+    responses={
+        400: {"model": ErrorDetail, "description": "Invalid Discord ID, or the Exophase username doesn't exist/is private"},
+        500: {"model": ErrorDetail, "description": "Failed to write to the links database"},
+    },
     summary="Create or update a Discord -> Exophase link",
+    description=(
+        "Registers (or overwrites) the Exophase username associated with a Discord user ID. "
+        "The username is verified against a real, public Exophase profile before being saved - "
+        "this both keeps the database from filling up with typos/made-up names, and doubles as "
+        "the 'edit' action: linking a new username for a Discord ID that's already linked just "
+        "overwrites the old mapping.\n\n"
+        "**No Discord authentication is performed.** This endpoint trusts whatever `discord_id` "
+        "it's given - it has no way to confirm the caller actually controls that Discord account. "
+        "A client that already knows its own logged-in user's ID (like the Equicord plugin, using "
+        "Discord's own UserStore) is a reasonable caller; a raw unauthenticated HTTP request could "
+        "in principle claim any Discord ID."
+    ),
 )
-async def set_link_endpoint(payload: LinkModel):
+async def set_link_endpoint(payload: LinkModel, scraper: ExophaseScraper = Depends(get_scraper)):
+    if not DISCORD_ID_PATTERN.match(payload.discord_id):
+        raise HTTPException(status_code=400, detail="discord_id doesn't look like a valid Discord snowflake.")
+
+    username = payload.exophase_username.strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="exophase_username can't be empty.")
+
+    # Confirm this is a real, public Exophase profile before saving it.
     try:
-        await set_link(payload.discord_id, payload.exophase_username)
-        return {"status": "ok", "discord_id": payload.discord_id, "exophase_username": payload.exophase_username}
+        await scraper.scrape_profile(username)
+    except UserNotFoundError:
+        raise HTTPException(status_code=400, detail=f"No public Exophase profile found for '{username}'.")
+    except PrivateProfileError:
+        raise HTTPException(status_code=400, detail=f"Exophase profile '{username}' is private.")
+    except ScraperError as e:
+        raise HTTPException(status_code=500, detail=f"Couldn't verify Exophase username: {e}")
+
+    try:
+        await set_link(payload.discord_id, username)
     except LinksStoreError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to write link for {payload.discord_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save link: {e}")
+
+    return {"discord_id": payload.discord_id, "exophase_username": username}
 
 
 @app.delete(
     "/api/v1/link/{discord_id}",
+    responses={
+        404: {"model": ErrorDetail, "description": "No Exophase account linked to this Discord ID"},
+        500: {"model": ErrorDetail, "description": "Failed to write to the links database"},
+    },
     summary="Remove a Discord -> Exophase link",
 )
 async def delete_link_endpoint(discord_id: str = Path(..., description="Discord ID to remove")):
     try:
         removed = await delete_link(discord_id)
-        if not removed:
-            raise HTTPException(status_code=404, detail="No such link")
-        return {"status": "deleted", "discord_id": discord_id}
     except LinksStoreError as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    if not removed:
+        raise HTTPException(status_code=404, detail="No such link")
+    return {"status": "deleted", "discord_id": discord_id}
