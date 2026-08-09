@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 # Import our robust scraper
 from scraper import ExophaseScraper, UserNotFoundError, PrivateProfileError, ScraperError, NotSupportedError
+from links_store import get_all_links, get_link, set_link, delete_link, LinksStoreError
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -573,3 +574,62 @@ async def get_user_summary(
     except Exception as e:
         logger.exception(f"Unexpected error while fetching summary for '{username}'")
         raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {e}")
+
+
+# --------------------------------------------------------------------------
+# Discord <-> Exophase link management
+# --------------------------------------------------------------------------
+class LinkModel(BaseModel):
+    discord_id: str = Field(..., description="Discord user ID as a string")
+    exophase_username: str = Field(..., description="Exophase username to associate")
+
+
+@app.get(
+    "/api/v1/links",
+    summary="List all Discord -> Exophase links",
+)
+async def list_links():
+    try:
+        return await get_all_links()
+    except LinksStoreError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/api/v1/link/{discord_id}",
+    summary="Get the Exophase username linked to a Discord ID",
+)
+async def get_link_endpoint(discord_id: str = Path(..., description="Discord ID to look up")):
+    try:
+        username = await get_link(discord_id)
+        if username is None:
+            raise HTTPException(status_code=404, detail="No link found for that Discord ID")
+        return {"discord_id": discord_id, "exophase_username": username}
+    except LinksStoreError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/api/v1/link",
+    summary="Create or update a Discord -> Exophase link",
+)
+async def set_link_endpoint(payload: LinkModel):
+    try:
+        await set_link(payload.discord_id, payload.exophase_username)
+        return {"status": "ok", "discord_id": payload.discord_id, "exophase_username": payload.exophase_username}
+    except LinksStoreError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete(
+    "/api/v1/link/{discord_id}",
+    summary="Remove a Discord -> Exophase link",
+)
+async def delete_link_endpoint(discord_id: str = Path(..., description="Discord ID to remove")):
+    try:
+        removed = await delete_link(discord_id)
+        if not removed:
+            raise HTTPException(status_code=404, detail="No such link")
+        return {"status": "deleted", "discord_id": discord_id}
+    except LinksStoreError as e:
+        raise HTTPException(status_code=500, detail=str(e))
